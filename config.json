@@ -9,5 +9,10 @@
   "overlap_x_percent": 10.0,
   "overlap_y_percent": 10.0,
   "output_image_size": 4000,
-  "downscale_factor": 0.05
+  "downscale_factor": 0.05,
+
+  "auto_alignment_translation_correction_um": {
+    "x": 10.0,
+    "y": -20.0
+  }
 }

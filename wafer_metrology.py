@@ -1,7 +1,11 @@
 import re
-import numpy as np
-import cv2
 from pathlib import Path
+
+import cv2
+import numpy as np
+
+import illumination_stitching
+
 
 def get_aligned_tile(src_img, alpha, scale_factor=1.0):
     h, w = src_img.shape[:2]
@@ -9,10 +13,12 @@ def get_aligned_tile(src_img, alpha, scale_factor=1.0):
     angle_deg = alpha * 180.0 / np.pi
     M = cv2.getRotationMatrix2D(center, angle_deg, scale_factor)
     return cv2.warpAffine(
-        src_img, M, (w, h),
+        src_img,
+        M,
+        (w, h),
         flags=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_CONSTANT,
-        borderValue=(0, 0, 0)
+        borderValue=(0, 0, 0),
     )
 
 
@@ -31,7 +37,7 @@ def fit_circle_least_squares(points):
 
 def robust_circle_fit(points, outlier_pct=0.012, max_iters=5):
     pts = np.array(points, dtype=np.float64)
-    for i in range(max_iters):
+    for _ in range(max_iters):
         xc, yc, R = fit_circle_least_squares(pts)
         dists = np.linalg.norm(pts - np.array([xc, yc]), axis=1)
         err = np.abs(dists - R)
@@ -47,6 +53,7 @@ def find_dynamic_clipping_bounds(contour_pts, ds_factor, base_tolerance_px=3):
     tolerance_px = int(np.clip(base_tolerance_px / ds_factor, 1, 20))
     x_coords = contour_pts[:, 0]
     y_coords = contour_pts[:, 1]
+
     left_edge, right_edge = np.min(x_coords), np.max(x_coords)
     top_edge, bottom_edge = np.min(y_coords), np.max(y_coords)
 
@@ -88,6 +95,7 @@ def robust_vertical_profile_flat(gray_img, xc_ds, yc_ds, R_ds, h_img, w_img, is_
                 if grad > 5.0 and intensity < 70 and (90 <= next_intensity <= 160):
                     profile_pts.append([x, y_start_scan + i + 1])
                     break
+
     return np.array(profile_pts, dtype=np.float64)
 
 
@@ -116,7 +124,6 @@ def geometry_based_flat_fit(circular_pts, xc_ds, yc_ds, R_ds):
         bottom_sector_mask = (angles >= np.pi / 2.0 - sector_half) & (angles <= np.pi / 2.0 + sector_half)
         flat_chord_mask = bottom_sector_mask & (dists >= 0.91 * R_ds) & (dists <= 0.995 * R_ds)
         flat_pts = circular_pts[flat_chord_mask]
-
         if len(flat_pts) < 10:
             continue
 
@@ -134,7 +141,6 @@ def geometry_based_flat_fit(circular_pts, xc_ds, yc_ds, R_ds):
 
         slope, intercept, residual = _weighted_line_fit(flat_pts)
         alpha_candidate = np.arctan(slope)
-
         if residual < best_residual:
             best_residual = residual
             best_alpha = alpha_candidate
@@ -153,7 +159,12 @@ def detect_wafer_on_canvas(ds_image, ds_factor):
     _, thresh = cv2.threshold(blurred, thresh_val, 255, cv2.THRESH_BINARY)
 
     cw, ch = int(w_img * 0.05), int(h_img * 0.05)
-    corners = [thresh[0:ch, 0:cw], thresh[0:ch, w_img-cw:w_img], thresh[h_img-ch:h_img, 0:cw], thresh[h_img-ch:h_img, w_img-cw:w_img]]
+    corners = [
+        thresh[0:ch, 0:cw],
+        thresh[0:ch, w_img - cw:w_img],
+        thresh[h_img - ch:h_img, 0:cw],
+        thresh[h_img - ch:h_img, w_img - cw:w_img],
+    ]
     corner_pixels = np.concatenate([c.flatten() for c in corners])
     corner_white_pct = (np.sum(corner_pixels == 255) / corner_pixels.size) * 100.0
 
@@ -173,9 +184,10 @@ def detect_wafer_on_canvas(ds_image, ds_factor):
     if k_size % 2 == 0:
         k_size += 1
     kernel_seg = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
-    eroded_mask = cv2.erode(wafer_mask, kernel_seg)
 
+    eroded_mask = cv2.erode(wafer_mask, kernel_seg)
     contours, _ = cv2.findContours(eroded_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
     solid_mask = np.zeros_like(wafer_mask)
     if contours:
         largest_contour = max(contours, key=cv2.contourArea)
@@ -195,9 +207,13 @@ def detect_wafer_on_canvas(ds_image, ds_factor):
     contour_pts = wafer_contour.squeeze(axis=1).astype(np.float64)
 
     left_lim, right_lim, top_lim, bottom_lim = find_dynamic_clipping_bounds(contour_pts, ds_factor)
-    boundary_mask = (contour_pts[:, 0] > left_lim) & (contour_pts[:, 0] < right_lim) & (contour_pts[:, 1] > top_lim) & (contour_pts[:, 1] < bottom_lim)
+    boundary_mask = (
+        (contour_pts[:, 0] > left_lim)
+        & (contour_pts[:, 0] < right_lim)
+        & (contour_pts[:, 1] > top_lim)
+        & (contour_pts[:, 1] < bottom_lim)
+    )
     circular_pts = contour_pts[boundary_mask]
-
     if len(circular_pts) < 10:
         circular_pts = contour_pts
 
@@ -217,54 +233,29 @@ def detect_wafer_on_canvas(ds_image, ds_factor):
             if np.sum(inliers) < 15:
                 break
             profile_pts = profile_pts[inliers]
-        return xc_ds / ds_factor, yc_ds / ds_factor, R_ds / ds_factor, np.arctan(np.polyfit(profile_pts[:, 0], profile_pts[:, 1], 1)[0])
+        return xc_ds / ds_factor, yc_ds / ds_factor, R_ds / ds_factor, np.arctan(
+            np.polyfit(profile_pts[:, 0], profile_pts[:, 1], 1)[0]
+        )
 
     flat_pts, alpha, _ = geometry_based_flat_fit(circular_pts, xc_ds, yc_ds, R_ds)
     if flat_pts is not None and len(flat_pts) >= 10:
         return xc_ds / ds_factor, yc_ds / ds_factor, R_ds / ds_factor, alpha
 
-    dists = np.sqrt((circular_pts[:, 0] - xc_ds)**2 + (circular_pts[:, 1] - yc_ds)**2)
+    dists = np.sqrt((circular_pts[:, 0] - xc_ds) ** 2 + (circular_pts[:, 1] - yc_ds) ** 2)
     angles_all = np.arctan2(circular_pts[:, 1] - yc_ds, circular_pts[:, 0] - xc_ds)
     search_angles = np.linspace(np.pi / 2.0 - 0.44, np.pi / 2.0 + 0.44, 360)
-    avg_dists = np.array([np.mean(dists[np.minimum(np.abs(angles_all - a), 2*np.pi - np.abs(angles_all - a)) <= 0.22]) for a in search_angles])
+    avg_dists = np.array([
+        np.mean(dists[np.minimum(np.abs(angles_all - a), 2 * np.pi - np.abs(angles_all - a)) <= 0.22])
+        for a in search_angles
+    ])
     return xc_ds / ds_factor, yc_ds / ds_factor, R_ds / ds_factor, search_angles[np.argmin(avg_dists)] - np.pi / 2.0
 
 
 def generate_downscaled_stitch(folder, config):
-    folder_path = Path(folder)
-    tile_files = list(folder_path.glob("tile_x*_y*.*"))
-    if not tile_files:
-        raise ValueError(f"No grid tile files found in: {folder}")
+    """
+    Illumination-normalized feather-blended coarse stitch.
 
-    tile_ext = tile_files[0].suffix
-    cols, rows = config["tile_cols"], config["tile_rows"]
-    tw, th, ds = config["tile_width"], config["tile_height"], config["downscale_factor"]
-    step_x = tw * (1.0 - config["overlap_x_percent"] / 100.0)
-    step_y = th * (1.0 - config["overlap_y_percent"] / 100.0)
-
-    canvas_w = int(((cols - 1) * step_x + tw) * ds)
-    canvas_h = int(((rows - 1) * step_y + th) * ds)
-    ds_canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
-
-    for tile_file in tile_files:
-        match = re.search(r'tile_x(\d+)_y(\d+)', tile_file.stem)
-        if not match:
-            continue
-        col, row = int(match.group(1)), int(match.group(2))
-
-        img = cv2.imread(str(tile_file))
-        if img is None:
-            continue
-
-        img_ds = cv2.resize(img, (int(tw * ds), int(th * ds)), interpolation=cv2.INTER_AREA)
-        x_can = max(0, int(((col - 1) * step_x) * ds))
-        y_can = max(0, int(((row - 1) * step_y) * ds))
-
-        h_ds, w_ds = img_ds.shape[:2]
-        h_ds_clamp = min(h_ds, canvas_h - y_can)
-        w_ds_clamp = min(w_ds, canvas_w - x_can)
-
-        if h_ds_clamp > 0 and w_ds_clamp > 0:
-            ds_canvas[y_can:y_can + h_ds_clamp, x_can:x_can + w_ds_clamp] = img_ds[:h_ds_clamp, :w_ds_clamp]
-
-    return ds_canvas, tile_ext
+    Same public API as the original function:
+        return ds_canvas, tile_ext
+    """
+    return illumination_stitching.generate_downscaled_stitch(folder, config, verbose=True)
