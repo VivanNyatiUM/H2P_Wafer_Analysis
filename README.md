@@ -9,7 +9,7 @@ Alignment and Device Image Creation:
 python .\wafer_alignment_and_extraction.py -c
 ```
 
-Detection and Labeling (skipping detection with --no-clean):
+Detection and Labeling (skipping detection with --no-clean, and optionally --use-design-mask, which may help reduce false positives, though unlikely):
 ```powershell
 python .\defect_detector.py --clean --review-ui --quick-review
 ```
