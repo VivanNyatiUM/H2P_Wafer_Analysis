@@ -2,7 +2,7 @@
 
 This project processes stitched microscope images of H2P wafer device cells, detects physical defects, lets a reviewer correct the detections, maps the reviewed regions into GDS coordinates, and subtracts those regions from selected GDS layers.
 
-The intended workflow is:
+The intended workflow is (PowerShell-based):
 
 Alignment and Device Image Creation:
 ```powershell
