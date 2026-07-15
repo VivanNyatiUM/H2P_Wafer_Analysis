@@ -86,8 +86,8 @@ A minimal `config.json` looks like:
 The tile grid size is detected from filenames when extraction runs. Tile filenames must contain coordinates in this form:
 
 ```text
-tile_x1_y1.tif
-tile_x2_y1.tif
+tile_x001_y001.jpg
+tile_x001_y002.jpg
 ...
 ```
 
