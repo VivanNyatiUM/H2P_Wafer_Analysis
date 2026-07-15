@@ -127,7 +127,8 @@ Comments beginning with `#` and blank lines are ignored.
 | `L` | Toggle annotation labels |
 | `K` | Copy current view to the Windows clipboard |
 | `Q` or `Esc` | Save and quit |
-| `1`–`5` | Assign class in standard typed mode only |
+| `1`–`5` | Assign class in standard typed mode only
+(no --quick-review) |
 
 Typed-mode classes are:
 
