@@ -51,7 +51,7 @@ large_wafer_tester.py               Large stitched-wafer inspection helpers
 wafer_align_gui.py                  Manual alignment interface
 wafer_metrology.py                  Wafer geometry and metrology helpers
 
-defect_detector.py                 Stage 2: automatic defect proposals
+defect_detector.py                  Stage 2: automatic defect proposals
 defect_mapper_gui.py                Fast review and labeling UI
 
 subtract_defects.py                 Stage 3: subtract reviewed masks from GDS
