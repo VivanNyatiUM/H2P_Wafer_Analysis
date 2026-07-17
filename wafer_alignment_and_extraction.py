@@ -12,6 +12,7 @@ import cv2
 import numpy as np
 
 import centroid_algorithm
+import cell_boundary_alignment
 import coordinate_transformer
 import defect_mapper_gui
 import gds_parser
@@ -21,7 +22,7 @@ import wafer_align_gui
 import wafer_metrology
 
 
-WAFER_EXTRACTION_VERSION = "simple-cli-create-2026-07-13"
+WAFER_EXTRACTION_VERSION = "bound-crop-v6-parallel-2026-07-15"
 
 
 # ===========================================================================
@@ -137,6 +138,7 @@ def apply_illumination_cli_to_config(config_run: dict, args) -> None:
     config_run["_shared_flatfield_samples"] = int(args.shared_flatfield_samples)
     config_run["_shared_flatfield_model_side"] = int(args.shared_flatfield_model_side)
     config_run["_overlap_leveling_strength"] = float(args.overlap_leveling_strength)
+    config_run["_fast_jpeg_decode"] = not bool(getattr(args, "bound_exact_jpeg_decode", False))
 
 
 def _as_float_or_zero(value, key_name: str) -> float:
@@ -666,6 +668,18 @@ def _extract_fast_crops_from_downscaled_canvas(
     return saved_count, records
 
 def process_wafer_cells(folder, json_file, config, args, wafer_id):
+    # H2P_BOUNDARY_ALIGNMENT_UPDATE_V2: physical-border refinement needs native-resolution local tiles.
+    # H2P_BOUNDARY_ALIGNMENT_UPDATE_V3_HYBRID: keep CPU and memory bounded before the coarse stitch starts.
+    if getattr(args, "bound", False):
+        _bound_threads = max(1, int(getattr(args, "bound_opencv_threads", 2)))
+        try:
+            cv2.setNumThreads(_bound_threads)
+        except Exception:
+            pass
+        print(
+            "[Runtime] --bound selected: using hybrid boundary detection with "
+            f"bounded scaled-native local crops (OpenCV threads={_bound_threads})."
+        )
     config_run = copy.deepcopy(config)
     apply_illumination_cli_to_config(config_run, args)
     out_stem = wafer_id
@@ -823,6 +837,37 @@ def process_wafer_cells(folder, json_file, config, args, wafer_id):
         meta_dir = out_dir / "metadata"
         meta_dir.mkdir(exist_ok=True)
 
+        # H2P_BOUNDARY_ALIGNMENT_UPDATE_V3_HYBRID: detect using the existing alignment, then stitch only a
+        # bounded local region at a controlled fraction of native resolution.
+        if getattr(args, "bound", False):
+            saved_count, cell_index_records = cell_boundary_alignment.extract_bound_crops(
+                folder=folder,
+                tile_ext=tile_ext,
+                cells=cells,
+                transformer=transformer,
+                config_run=config_run,
+                args=args,
+                out_stem=out_stem,
+                out_dir=out_dir,
+                preview_dir=preview_dir,
+                analysis_dir=analysis_dir,
+                mask_dir=mask_dir,
+                meta_dir=meta_dir,
+                save_crop_artifacts=_save_crop_artifacts,
+            )
+            illumination_stitching.save_cell_metadata_json(
+                meta_dir / f"{out_stem}_cell_index.json",
+                {
+                    "wafer_id": out_stem,
+                    "count": int(saved_count),
+                    "crop_source": "scaled_native_physical_boundary",
+                    "cells": cell_index_records,
+                },
+            )
+            print(f"[{out_stem}] Boundary slicing complete. Extracted {saved_count} cells.")
+            print(f"[{out_stem}] Lossless detector inputs: {analysis_dir}")
+            print(f"[{out_stem}] Boundary diagnostics: {out_dir / 'boundary_debug'}")
+            return True
         if str(getattr(args, "crop_source", "fast")).lower() == "fast":
             saved_count, cell_index_records = _extract_fast_crops_from_downscaled_canvas(
                 ds_canvas=ds_canvas,
@@ -903,6 +948,20 @@ def process_wafer_cells(folder, json_file, config, args, wafer_id):
                 (min_x, max_y),
             ]
             pts_canvas = np.array([transformer.gds_to_canvas(gx, gy) for gx, gy in gds_corners], dtype=np.float64)
+            if getattr(args, "bound", False):
+                _bound_top = float(np.linalg.norm(pts_canvas[1] - pts_canvas[0]))
+                _bound_bottom = float(np.linalg.norm(pts_canvas[2] - pts_canvas[3]))
+                _bound_left = float(np.linalg.norm(pts_canvas[3] - pts_canvas[0]))
+                _bound_right = float(np.linalg.norm(pts_canvas[2] - pts_canvas[1]))
+                _bound_long_side = max(
+                    _bound_top, _bound_bottom, _bound_left, _bound_right, 1.0
+                )
+                # The existing native crop uses `pad` in x1/y1/x2/y2. Increasing it
+                # here preserves that code while guaranteeing enough outward context.
+                pad = max(
+                    int(getattr(args, "bound_pad", 400)),
+                    int(round(_bound_long_side * float(getattr(args, "bound_expand", 1.25)))),
+                )
 
             cx_min, cy_min = np.min(pts_canvas, axis=0)
             cx_max, cy_max = np.max(pts_canvas, axis=0)
@@ -976,6 +1035,52 @@ def process_wafer_cells(folder, json_file, config, args, wafer_id):
                 continue
 
             cell_crop = rotated_local_canvas[crop_y1:crop_y2, crop_x1:crop_x2]
+            boundary_metadata = {
+                "enabled": bool(getattr(args, "bound", False)),
+                "applied": False,
+            }
+            if getattr(args, "bound", False):
+                approximate_local_quad = (
+                    pts_canvas.astype(np.float32)
+                    - np.array([x1, y1], dtype=np.float32)
+                )
+                debug_path = None
+                if getattr(args, "bound_debug", False):
+                    debug_path = (
+                        out_dir
+                        / "boundary_debug"
+                        / f"{out_stem}_cell_{row}-{col}_boundary.jpg"
+                    )
+                boundary_result = cell_boundary_alignment.refine_and_rectify_cell(
+                    local_canvas,
+                    approximate_local_quad,
+                    masks=local_masks,
+                    search_inward_fraction=float(
+                        getattr(args, "bound_search_inward_fraction", 0.08)
+                    ),
+                    min_confidence=float(getattr(args, "bound_min_confidence", 0.22)),
+                    output_scale=float(getattr(args, "bound_output_scale", 1.0)),
+                    shave_px=int(args.shave),
+                    debug_path=debug_path,
+                )
+                boundary_metadata = dict(boundary_result.metadata or {})
+                boundary_metadata["enabled"] = True
+                boundary_metadata["applied"] = bool(boundary_result.success)
+                boundary_metadata["fallback_reason"] = (
+                    "" if boundary_result.success else boundary_result.reason
+                )
+                if boundary_result.success:
+                    cell_crop = boundary_result.image
+                    rotated_local_masks = boundary_result.masks
+                    crop_x1 = 0
+                    crop_y1 = 0
+                    crop_x2 = int(cell_crop.shape[1])
+                    crop_y2 = int(cell_crop.shape[0])
+                else:
+                    print(
+                        f"\n[{out_stem} Bound] Cell {row}-{col}: "
+                        f"{boundary_result.reason}; using the original GDS crop fallback."
+                    )
             cell_stem = f"{out_stem}_cell_{row}-{col}"
 
             metadata = {
@@ -1000,6 +1105,12 @@ def process_wafer_cells(folder, json_file, config, args, wafer_id):
                 "legacy_jpg": str((out_dir / f"{cell_stem}.jpg").as_posix()),
                 "seam_mask": str((mask_dir / f"{cell_stem}_seam_mask.png").as_posix()),
             }
+            metadata["boundary_alignment"] = boundary_metadata
+            metadata["crop_source"] = (
+                "native_physical_boundary"
+                if boundary_metadata.get("applied")
+                else "native_gds_fallback"
+            )
 
             _save_crop_artifacts(
                 out_dir=out_dir,
@@ -1155,6 +1266,102 @@ def main():
     parser.add_argument("--shared-flatfield-model-side", type=int, default=384, help="Max side length of shared flat-field model")
     parser.add_argument("--overlap-leveling-strength", type=float, default=0.85, help="Strength of overlap LAB-L leveling")
 
+    parser.add_argument(
+        "--bound",
+        action="store_true",
+        help=(
+            "Use the transformed GDS cell only as a seed, detect the four physical "
+            "cell borders, and perspective-rectify a native-resolution crop."
+        ),
+    )
+    parser.add_argument(
+        "--bound-pad",
+        type=int,
+        default=250,
+        help="Minimum raw pixels searched beyond each approximate GDS cell. Default: 250",
+    )
+    parser.add_argument(
+        "--bound-expand",
+        type=float,
+        default=0.18,
+        help="Search padding as a fraction of the approximate cell's longer side. Default: 0.18",
+    )
+    parser.add_argument(
+        "--bound-search-inward-fraction",
+        type=float,
+        default=0.08,
+        help="Permit border search slightly inside the GDS seed edge. Default: 0.08",
+    )
+    parser.add_argument(
+        "--bound-min-confidence",
+        type=float,
+        default=0.22,
+        help="Minimum border-fit confidence before falling back to the GDS crop. Default: 0.22",
+    )
+    parser.add_argument(
+        "--bound-output-scale",
+        type=float,
+        default=1.0,
+        help="Scale applied to the rectified native crop. Default: 1.0",
+    )
+    parser.add_argument(
+        "--bound-debug",
+        action="store_true",
+        help="Write orange seed and green detected-border overlays under boundary_debug.",
+    )
+    parser.add_argument(
+        "--bound-native-scale",
+        type=float,
+        default=0.20,
+        help=(
+            "Resolution of each bounded local stitch relative to raw tiles. "
+            "0.20 is 2.4x sharper than a 1/12 stitch when the memory cap allows it. Default: 0.20"
+        ),
+    )
+    parser.add_argument(
+        "--bound-max-local-megapixels",
+        type=float,
+        default=8.0,
+        help="Maximum pixels in one scaled local stitch. Default: 8 MP",
+    )
+    parser.add_argument(
+        "--bound-detect-max-side",
+        type=int,
+        default=1600,
+        help=(
+            "Maximum side used by the expensive boundary feature pass; the final "
+            "crop still uses the higher-resolution local stitch. Default: 1600"
+        ),
+    )
+    parser.add_argument(
+        "--bound-tile-cache-size",
+        type=int,
+        default=64,
+        help="Number of scaled normalized tiles reused across neighboring cells. Default: 64",
+    )
+    parser.add_argument(
+        "--bound-opencv-threads",
+        type=int,
+        default=1,
+        help="OpenCV worker threads while --bound is active. Default: 2",
+    )
+    parser.add_argument(
+        "--bound-workers",
+        type=int,
+        default=3,
+        help=(
+            "Number of cells processed concurrently by --bound. Default: 3. "
+            "Use 1 for minimum RAM or exact v4 execution order."
+        ),
+    )
+    parser.add_argument(
+        "--bound-exact-jpeg-decode",
+        action="store_true",
+        help=(
+            "Disable the faster reduced-DCT JPEG decode path. This reproduces "
+            "v4 tile decoding at the cost of longer runtime."
+        ),
+    )
     args = parser.parse_args()
     print(f"[Runtime] version={WAFER_EXTRACTION_VERSION}")
     _apply_simple_create_defaults(args)

@@ -215,6 +215,46 @@ def read_bgr(path: Path | str) -> np.ndarray:
     return img
 
 
+
+def read_bgr_resized_fast(
+    path: Path | str,
+    target_w: int,
+    target_h: int,
+    *,
+    expected_w: int | None = None,
+    expected_h: int | None = None,
+    enabled: bool = True,
+) -> np.ndarray:
+    """Decode a JPEG near its final size before the normal resize.
+
+    OpenCV's reduced-DCT JPEG modes decode fewer frequency blocks instead of
+    decoding the full camera frame and immediately throwing most pixels away.
+    A 1/4 decode is used for the 1/12 coarse stitch; non-JPEG inputs and any
+    decoder failure fall back to the original full decode path.
+    """
+    path = Path(path)
+    target_w = max(1, int(target_w))
+    target_h = max(1, int(target_h))
+    img = None
+    if enabled and path.suffix.lower() in {".jpg", ".jpeg", ".jpe"}:
+        ew = max(1, int(expected_w or target_w))
+        eh = max(1, int(expected_h or target_h))
+        ratio = max(target_w / float(ew), target_h / float(eh))
+        flag = None
+        if ratio <= 0.30:
+            flag = cv2.IMREAD_REDUCED_COLOR_4
+        elif ratio <= 0.60:
+            flag = cv2.IMREAD_REDUCED_COLOR_2
+        if flag is not None:
+            try:
+                data = np.fromfile(str(path), dtype=np.uint8)
+                img = cv2.imdecode(data, flag)
+            except Exception:
+                img = None
+    if img is None:
+        img = read_bgr(path)
+    return resize_if_needed(img, target_w, target_h)
+
 def imwrite(path: Path | str, img: np.ndarray, params: Optional[list[int]] = None) -> bool:
     """cv2.imwrite replacement that is safe with Windows paths."""
     path = Path(path)
@@ -888,11 +928,16 @@ def generate_downscaled_stitch(
         if col < 1 or col > cols or row < 1 or row > rows:
             continue
         try:
-            img = read_bgr(tile_file)
+            img_ds = read_bgr_resized_fast(
+                tile_file,
+                tile_w_ds,
+                tile_h_ds,
+                expected_w=tw,
+                expected_h=th,
+                enabled=bool(config.get("_fast_jpeg_decode", True)),
+            )
         except Exception:
             continue
-
-        img_ds = resize_if_needed(img, tile_w_ds, tile_h_ds)
         img_ds = normalize_tile_bgr(
             img_ds,
             target_luma=target_luma,
