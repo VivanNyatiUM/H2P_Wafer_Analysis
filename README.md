@@ -4,7 +4,7 @@ This project processes stitched microscope images of H2P wafer device cells, det
 
 The intended workflow is (PowerShell-based):
 
-Alignment and Device Image Creation (use --bound --bound-exact-jpeg-decode --bound-workers 3 for higher quality better images):
+Alignment and Device Image Creation (use --bound --bound-exact-jpeg-decode --bound-workers 3 for higher quality and perfectly cropped images):
 ```powershell
 python .\wafer_alignment_and_extraction.py -c
 ```
