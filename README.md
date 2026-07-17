@@ -6,7 +6,7 @@ The intended workflow is (PowerShell-based):
 
 Alignment and Device Image Creation:
 ```powershell
-python .\wafer_alignment_and_extraction.py -c
+python .\wafer_alignment_and_extraction.py -c --bound
 ```
 
 Defect Detection and Labeling (optionally use --use-design-mask):
