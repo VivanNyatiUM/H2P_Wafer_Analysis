@@ -4886,6 +4886,29 @@ def launch_review_ui(
         show_annotation_labels=not bool(review_hide_labels or quick_review),
     )
     tool.run()
+    # REVIEWED_WAFER_STITCH_AFTER_REVIEW_V1
+    # The review UI edits annotations_json in place. Once it closes, rebuild a
+    # GDS-positioned wafer overview from the final reviewed JSON so retained
+    # automatic polygons and manually added regions appear together.
+    try:
+        from reviewed_defect_wafer_stitch import build_reviewed_wafer_stitch
+
+        reviewed_stitch = build_reviewed_wafer_stitch(
+            image_dir=Path(image_dir),
+            annotations_json=Path(annotations_json),
+            metadata_dir=Path(metadata_dir),
+            wafer_id=str(wafer_id or ""),
+        )
+        print(
+            "[Reviewed Wafer Stitch] Saved: "
+            f"{reviewed_stitch['outputs']['composite']}"
+        )
+    except Exception as exc:
+        # Do not destroy reviewed labels just because overview generation fails.
+        print(
+            "[Reviewed Wafer Stitch] WARNING: "
+            f"overview generation failed: {exc}"
+        )
 
 
 # ---------------------------------------------------------------------------

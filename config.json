@@ -12,7 +12,7 @@
   "downscale_factor": 0.05,
 
   "auto_alignment_translation_correction_um": {
-    "x": 10.0,
-    "y": -20.0
+    "x": 0.0,
+    "y": 0.0
   }
 }
