@@ -88,17 +88,13 @@ python .\review_batch_wafers.py --quick-review --dry-run
 ### 3. GDS subtraction
 
 ```powershell
-python .\subtract_defects.py `
-    .\extracted_cells\Wafer_topcontact\Wafer_topcontact_device_defects.json `
-    -l num1 num2 ...
+python .\subtract_defects.py .\extracted_cells\Wafer_{name}\Wafer_topcontact_device_defects.json -l num1 num2 ...
 ```
 
 A more specific example:
 
 ```powershell
-python .\subtract_defects.py `
-    .\extracted_cells\Wafer_topcontact\Wafer_topcontact_device_defects.json `
-    -l 1 4
+python .\subtract_defects.py .\extracted_cells\Wafer_topcontact\Wafer_topcontact_device_defects.json -l 1 4
 ```
 
 The reviewed-wafer stitcher also writes wafer-level inspection images beside the reviewed JSON after the review UI closes.
