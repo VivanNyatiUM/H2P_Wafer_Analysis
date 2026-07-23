@@ -19,11 +19,7 @@ python .\wafer_alignment_and_extraction.py -c
 For higher-quality, exact-boundary JPEG extraction, add:
 
 ```powershell
-python .\wafer_alignment_and_extraction.py `
-    -c `
-    --bound `
-    --bound-exact-jpeg-decode `
-    --bound-workers 3
+python .\wafer_alignment_and_extraction.py -c --bound --bound-exact-jpeg-decode --bound-workers 3
 ```
 
 A batch run automatically writes every wafer into its own output directory:
