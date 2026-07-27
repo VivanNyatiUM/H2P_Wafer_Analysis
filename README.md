@@ -154,30 +154,36 @@ The main files are:
 2.  wafer_alignment_and_extraction_old.py   Underlying extraction implementation
 3.  future_design_adapter.py                Future-design alignment adapter
 4.  future_alignment.py                     Future-design alignment helpers
-5.  centroid_algorithm.py                   Automatic wafer/cell feature alignment
-6.  coordinate_transformer.py               Pixel-to-GDS coordinate transforms
-7.  gds_parser.py                           GDS boundary and overlay parsing
-8.  illumination_stitching.py               Flat-field correction and tile stitching
-9.  large_wafer_tester.py                   Large stitched-wafer inspection helpers
-10. wafer_align_gui.py                      Manual alignment interface
-11. wafer_metrology.py                      Wafer geometry and metrology helpers
+5.  alignment_marker_ui_upgrade.py          Interactive alignment-marker manipulation UI
+6.  cell_boundary_alignment.py              Exact device-boundary alignment helpers
+7.  centroid_algorithm.py                   Automatic wafer/cell feature alignment
+8.  coordinate_transformer.py               Pixel-to-GDS coordinate transforms
+9.  gds_parser.py                           GDS boundary and overlay parsing
+10. illumination_stitching.py               Flat-field correction and tile stitching
+11. large_wafer_tester.py                   Large stitched-wafer inspection helpers
+12. wafer_align_gui.py                      Manual alignment interface
+13. wafer_metrology.py                      Wafer geometry and metrology helpers
 
-12. defect_detector.py                      Core automatic defect detector
-13. defect_detector_analysis_roi.py         Padded analysis ROI and inverse mapping
-14. defect_mapper_gui.py                    Fast review and labeling UI
-15. review_batch_wafers.py                  Runs the detector separately per wafer
-16. reviewed_defect_wafer_stitch.py         Creates reviewed wafer-level images
-17. device_index_defect_viewer.py           Cross-wafer device-index inspection UI
+14. defect_detector.py                      Core automatic defect detector
+15. defect_detector_analysis_roi.py         Padded analysis ROI and inverse mapping
+16. defect_mapper_gui.py                    Fast review and labeling UI
+17. review_batch_wafers.py                  Runs the detector separately per wafer
+18. reviewed_defect_wafer_stitch.py         Creates reviewed wafer-level images
+19. device_index_defect_viewer.py           Cross-wafer device-index inspection UI
 
-18. subtract_defects.py                     Stage 4 GDS subtraction
-19. batch_wafers_parser.py                  Compact and legacy batch-file parser
-20. wafer_run_layout.py                     Per-wafer output path helpers
-21. migrate_combined_extracted_cells.py     Migrates older combined extraction output
+20. subtract_defects.py                     Stage 4 GDS subtraction
+21. batch_wafers_parser.py                  Compact and legacy batch-file parser
+22. wafer_run_layout.py                     Per-wafer output path helpers
+23. h2p_progress.py                         Shared command-line progress reporting
+24. migrate_combined_extracted_cells.py     Migrates older combined extraction output
+25. copy_tiles.py                           Optional tile-copying utility
 
-22. config.json                             Geometry and stitching configuration
-23. batch_wafers.txt                        Compact wafer-name list
-24. future_design.gds                       Active future-design GDS
-25. semiconductor_design.gds                Legacy GDS used by the old workflow
+26. config.json                             Geometry and stitching configuration
+27. batch_wafers.txt                        Compact wafer-name list
+28. future_design.gds                       Active future-design GDS
+29. semiconductor_design.gds                Legacy GDS used by the old workflow
+
+30. assets\h2pLogo.png                      H2P logo used by the device viewer
 ```
 
 ## Configuration
