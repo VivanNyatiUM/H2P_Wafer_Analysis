@@ -150,34 +150,34 @@ python -m pip install numpy opencv-python pillow gdstk
 The main files are:
 
 ```text
-wafer_alignment_and_extraction.py       Stage 1 entry point
-wafer_alignment_and_extraction_old.py   Underlying extraction implementation
-future_design_adapter.py                Future-design alignment adapter
-future_alignment.py                     Future-design alignment helpers
-centroid_algorithm.py                   Automatic wafer/cell feature alignment
-coordinate_transformer.py               Pixel-to-GDS coordinate transforms
-gds_parser.py                           GDS boundary and overlay parsing
-illumination_stitching.py               Flat-field correction and tile stitching
-large_wafer_tester.py                   Large stitched-wafer inspection helpers
-wafer_align_gui.py                      Manual alignment interface
-wafer_metrology.py                      Wafer geometry and metrology helpers
+1.  wafer_alignment_and_extraction.py       Stage 1 entry point
+2.  wafer_alignment_and_extraction_old.py   Underlying extraction implementation
+3.  future_design_adapter.py                Future-design alignment adapter
+4.  future_alignment.py                     Future-design alignment helpers
+5.  centroid_algorithm.py                   Automatic wafer/cell feature alignment
+6.  coordinate_transformer.py               Pixel-to-GDS coordinate transforms
+7.  gds_parser.py                           GDS boundary and overlay parsing
+8.  illumination_stitching.py               Flat-field correction and tile stitching
+9.  large_wafer_tester.py                   Large stitched-wafer inspection helpers
+10. wafer_align_gui.py                      Manual alignment interface
+11. wafer_metrology.py                      Wafer geometry and metrology helpers
 
-defect_detector.py                      Core automatic defect detector
-defect_detector_analysis_roi.py         Padded analysis ROI and inverse mapping
-defect_mapper_gui.py                    Fast review and labeling UI
-review_batch_wafers.py                  Runs the detector separately per wafer
-reviewed_defect_wafer_stitch.py         Creates reviewed wafer-level images
-device_index_defect_viewer.py           Cross-wafer device-index inspection UI
+12. defect_detector.py                      Core automatic defect detector
+13. defect_detector_analysis_roi.py         Padded analysis ROI and inverse mapping
+14. defect_mapper_gui.py                    Fast review and labeling UI
+15. review_batch_wafers.py                  Runs the detector separately per wafer
+16. reviewed_defect_wafer_stitch.py         Creates reviewed wafer-level images
+17. device_index_defect_viewer.py           Cross-wafer device-index inspection UI
 
-subtract_defects.py                     Stage 4 GDS subtraction
-batch_wafers_parser.py                  Compact and legacy batch-file parser
-wafer_run_layout.py                     Per-wafer output path helpers
-migrate_combined_extracted_cells.py     Migrates older combined extraction output
+18. subtract_defects.py                     Stage 4 GDS subtraction
+19. batch_wafers_parser.py                  Compact and legacy batch-file parser
+20. wafer_run_layout.py                     Per-wafer output path helpers
+21. migrate_combined_extracted_cells.py     Migrates older combined extraction output
 
-config.json                             Geometry and stitching configuration
-batch_wafers.txt                        Compact wafer-name list
-future_design.gds                       Active future-design GDS
-semiconductor_design.gds                Legacy GDS used by the old workflow
+22. config.json                             Geometry and stitching configuration
+23. batch_wafers.txt                        Compact wafer-name list
+24. future_design.gds                       Active future-design GDS
+25. semiconductor_design.gds                Legacy GDS used by the old workflow
 ```
 
 ## Configuration
