@@ -187,6 +187,7 @@ The main files are:
 ```
 
 ## Configuration
+Should be changed to semiconductor_design.gds if using the legacy pipeline.
 
 ```json
 {
