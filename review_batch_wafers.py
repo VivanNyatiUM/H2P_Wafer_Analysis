@@ -71,7 +71,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     )
     parser.add_argument("--batch", default="batch_wafers.txt")
     parser.add_argument("--base", default="extracted_cells")
-    parser.add_argument("--detector", default="defect_detector.py")
+    parser.add_argument("--detector", default="defect_detector_analysis_roi.py")
     parser.add_argument("--wafer", action="append", default=[])
     parser.add_argument("--no-review", action="store_true")
     parser.add_argument("--quick-review", action="store_true")

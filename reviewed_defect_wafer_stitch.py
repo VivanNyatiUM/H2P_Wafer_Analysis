@@ -36,9 +36,11 @@ from typing import Any, Iterable, Optional
 import cv2
 import numpy as np
 
+from h2p_progress import ProgressBar
+
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
-VERSION = "reviewed-wafer-stitch-v1-2026-07-23"
+VERSION = "reviewed-wafer-stitch-v2-progress-2026-07-24"
 
 AUTO_COLOR = (0, 0, 255)
 MANUAL_COLOR = (255, 255, 0)
@@ -826,7 +828,13 @@ def build_reviewed_wafer_stitch(
 
     clean = np.full((canvas_height, canvas_width, 3), 22, dtype=np.uint8)
 
-    for cell in cells:
+    print(
+        f"[Reviewed Wafer Stitch] Building {wafer_id}: "
+        f"{len(cells)} cells on a {canvas_width}x{canvas_height} canvas.",
+        flush=True,
+    )
+    cell_bar = ProgressBar("Review stitch: cells", len(cells))
+    for cell_index, cell in enumerate(cells, start=1):
         destination = _gds_to_canvas_points(
             cell.image_corners_gds,
             min_x=min_x,
@@ -840,6 +848,8 @@ def build_reviewed_wafer_stitch(
             destination,
             cell_border=cell_border,
         )
+        cell_bar.update(cell_index, extra=cell.image_path.name)
+    cell_bar.done(extra=f"stitched {len(cells)} cells")
 
     composite = clean.copy()
     outline = clean.copy()
@@ -853,9 +863,20 @@ def build_reviewed_wafer_stitch(
     skipped_annotations = 0
     records_rendered: list[dict[str, Any]] = []
 
-    for cell in cells:
-        records = _annotations_for_cell(cell, annotation_lookup)
+    records_by_cell = [
+        (cell, _annotations_for_cell(cell, annotation_lookup))
+        for cell in cells
+    ]
+    annotation_total = sum(len(records) for _cell, records in records_by_cell)
+    annotation_bar = ProgressBar("Review stitch: defects", annotation_total)
+    annotation_index = 0
+    for cell, records in records_by_cell:
         for record in records:
+            annotation_index += 1
+            annotation_bar.update(
+                annotation_index,
+                extra=f"{cell.annotation_name}: {annotation_index}/{annotation_total}",
+            )
             points_gds = _record_points_gds(record, cell)
             if points_gds is None or len(points_gds) < 3:
                 skipped_annotations += 1
@@ -908,6 +929,13 @@ def build_reviewed_wafer_stitch(
                     "vertex_count": int(len(points_gds)),
                 }
             )
+
+    annotation_bar.done(
+        extra=(
+            f"rendered {automatic_count + manual_count}; "
+            f"skipped {skipped_annotations}"
+        )
+    )
 
     alpha = float(np.clip(fill_alpha, 0.0, 1.0))
     active = combined_mask > 0
@@ -978,12 +1006,19 @@ def build_reviewed_wafer_stitch(
     auto_mask_path = output_dir / f"{wafer_id}_reviewed_wafer_auto_mask.png"
     manual_mask_path = output_dir / f"{wafer_id}_reviewed_wafer_manual_mask.png"
 
-    _write_image(clean_path, clean)
-    _write_image(composite_path, composite)
-    _write_image(outline_path, outline)
-    _write_image(mask_path, combined_mask)
-    _write_image(auto_mask_path, auto_mask)
-    _write_image(manual_mask_path, manual_mask)
+    image_outputs = [
+        (clean_path, clean),
+        (composite_path, composite),
+        (outline_path, outline),
+        (mask_path, combined_mask),
+        (auto_mask_path, auto_mask),
+        (manual_mask_path, manual_mask),
+    ]
+    output_bar = ProgressBar("Review stitch: output", len(image_outputs) + 1)
+    for output_index, (output_path, output_image) in enumerate(image_outputs, start=1):
+        output_bar.status(f"encoding {output_path.name}")
+        _write_image(output_path, output_image)
+        output_bar.update(output_index, extra=f"saved {output_path.name}", force=True)
 
     report = {
         "version": VERSION,
@@ -1013,8 +1048,10 @@ def build_reviewed_wafer_stitch(
         "rendered_records": records_rendered,
     }
     report_path = output_dir / f"{wafer_id}_reviewed_wafer_report.json"
+    output_bar.status(f"writing {report_path.name}")
     _write_json(report_path, report)
     report["outputs"]["report"] = str(report_path)
+    output_bar.done(extra=f"saved {len(image_outputs)} images and report")
     return report
 
 

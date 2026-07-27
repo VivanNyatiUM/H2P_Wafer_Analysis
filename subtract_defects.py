@@ -8,6 +8,11 @@ from typing import Iterable
 
 import numpy as np
 import gdstk
+from h2p_progress import ProgressBar
+from batch_wafers_parser import parse_batch_file
+from wafer_run_layout import normalize_wafer_id, select_wafer_ids
+
+# >>> H2P SUBTRACTION PROGRESS V2 >>>
 
 DEFAULT_ALIGNMENT_ERROR_ANGLE_DEG = 0.001
 DEFAULT_ALIGNMENT_ERROR_X_PX = 2.0
@@ -415,13 +420,15 @@ def create_removal_report(
     }
 
     rows: list[dict] = []
-    for canonical, record in sorted(
-        devices.items(),
-        key=lambda kv: (
-            kv[1].get("row") if kv[1].get("row") is not None else 10**9,
-            kv[1].get("col") if kv[1].get("col") is not None else 10**9,
-            kv[0],
-        ),
+    # H2P_PROGRESS_REPORT_DEVICES_V2
+    _h2p_sorted_devices = sorted(devices.items(), key=lambda kv: (kv[1].get('row') if kv[1].get('row') is not None else 10 ** 9, kv[1].get('col') if kv[1].get('col') is not None else 10 ** 9, kv[0]))
+    _h2p_report_bar = ProgressBar(
+        "Removal report: devices",
+        len(_h2p_sorted_devices),
+    )
+    for _h2p_device_index, (canonical, record) in enumerate(
+        _h2p_sorted_devices,
+        start=1,
     ):
         device_window = record["polygon"]
         device_defects = _device_defects_for_record(record, defects_by_device)
@@ -467,6 +474,13 @@ def create_removal_report(
             "percent": percent,
             "layers": per_layer,
         })
+        _h2p_report_bar.update(
+            _h2p_device_index,
+            extra=str(record.get("display_name", canonical)),
+        )
+    _h2p_report_bar.done(
+        extra=f"calculated {len(rows)} devices",
+    )
 
     valid_rows = [r for r in rows if np.isfinite(r["percent"])]
     mean_percent = float(np.mean([r["percent"] for r in valid_rows])) if valid_rows else float("nan")
@@ -550,7 +564,11 @@ def create_removal_report(
         lines.append("Average device removal percentage (unweighted mean): N/A")
         lines.append("Overall removal percentage (area weighted): N/A")
 
+    # H2P_PROGRESS_REPORT_FILE_V2
+    _h2p_report_file_bar = ProgressBar("Removal report: file", 1)
+    _h2p_report_file_bar.status(f"writing {report_path.name}")
     report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _h2p_report_file_bar.done(extra=f"saved {report_path.name}")
     print(f"[REPORT] Per-device removal report saved to: {report_path}")
     return report_path
 
@@ -637,18 +655,46 @@ def subtract_defects_from_gds(
     print(f"[INFO] Discovered {len(all_polygons)} total polygons across all layers.")
 
     polys_by_layer_type: dict[tuple[int, int], list[gdstk.Polygon]] = {}
-    for poly in all_polygons:
+    # H2P_PROGRESS_INDEX_POLYGONS_V2
+    _h2p_grouping_bar = ProgressBar(
+        "Mask: index GDS polygons",
+        len(all_polygons),
+    )
+    for _h2p_polygon_index, poly in enumerate(all_polygons, start=1):
         key = (poly.layer, poly.datatype)
         polys_by_layer_type.setdefault(key, []).append(poly)
+        _h2p_grouping_bar.update(
+            _h2p_polygon_index,
+            extra=f"layer {poly.layer}/{poly.datatype}",
+        )
+    _h2p_grouping_bar.done(
+        extra=f"indexed {len(all_polygons)} polygons",
+    )
 
     final_polygons: list[gdstk.Polygon] = []
     target_layers_set = set(int(layer) for layer in target_layers)
+    # H2P_PROGRESS_MASK_LAYERS_V2
+    _h2p_layer_groups = list(polys_by_layer_type.items())
+    _h2p_mask_bar = ProgressBar(
+        "Mask: subtract layers",
+        len(_h2p_layer_groups),
+    )
     if not defect_polygons:
         print("[INFO] No defects found in JSON. Writing original file unchanged.")
-        for layer_polys in polys_by_layer_type.values():
+        for _h2p_group_index, ((layer, datatype), layer_polys) in enumerate(
+            _h2p_layer_groups,
+            start=1,
+        ):
             final_polygons.extend(layer_polys)
+            _h2p_mask_bar.update(
+                _h2p_group_index,
+                extra=f"copied layer {layer}/{datatype}",
+            )
     else:
-        for (layer, datatype), layer_polys in polys_by_layer_type.items():
+        for _h2p_group_index, ((layer, datatype), layer_polys) in enumerate(
+            _h2p_layer_groups,
+            start=1,
+        ):
             if layer in target_layers_set:
                 print(
                     f" -> Cutting defect regions from Layer {layer}, Datatype {datatype} "
@@ -665,13 +711,41 @@ def subtract_defects_from_gds(
                 final_polygons.extend(subtracted)
             else:
                 final_polygons.extend(layer_polys)
+            _h2p_mask_bar.update(
+                _h2p_group_index,
+                extra=f"processed layer {layer}/{datatype}",
+                force=True,
+            )
+    _h2p_mask_bar.done(
+        extra=f"prepared {len(final_polygons)} output polygons",
+    )
 
     new_top_cell = gdstk.Cell(original_top.name)
-    for polygon in final_polygons:
+    # H2P_PROGRESS_GDS_ASSEMBLY_V2
+    _h2p_assembly_bar = ProgressBar(
+        "Output GDS: assemble",
+        len(final_polygons),
+    )
+    for _h2p_output_index, polygon in enumerate(final_polygons, start=1):
         new_top_cell.add(polygon)
+        _h2p_assembly_bar.update(
+            _h2p_output_index,
+            extra=f"polygon {_h2p_output_index}",
+        )
+    _h2p_assembly_bar.done(
+        extra=f"assembled {len(final_polygons)} polygons",
+    )
     output_lib = gdstk.Library(name=lib.name, unit=lib.unit, precision=lib.precision)
     output_lib.add(new_top_cell)
+    # H2P_PROGRESS_GDS_FILE_V2
+    _h2p_gds_file_bar = ProgressBar("Output GDS: file", 1)
+    _h2p_gds_file_bar.status(
+        f"writing {Path(output_path).name}",
+    )
     output_lib.write_gds(output_path)
+    _h2p_gds_file_bar.done(
+        extra=f"saved {Path(output_path).name}",
+    )
     print(f"[SUCCESS] Subtraction complete. Saved flat GDS file to: {output_path}")
 
     if write_report:
@@ -693,67 +767,463 @@ def subtract_defects_from_gds(
         )
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description=(
-            "Subtract defect regions from GDS layers and write a per-device removed-area report. "
-            "Simple mode: python subtract_defects.py Wafer_A_device_defects.json -l 1 4"
-        )
+# >>> H2P WAFER-AWARE OUTPUT NAME >>>
+def _default_subtracted_output_path(json_path: str | Path) -> Path:
+    """Derive a stable output name from the input wafer defect JSON."""
+    json_file = Path(json_path)
+    wafer_stem = json_file.stem.strip()
+    for suffix in ("_device_defects", "_defects"):
+        if wafer_stem.lower().endswith(suffix):
+            wafer_stem = wafer_stem[: -len(suffix)].rstrip("_- ")
+            break
+    if not wafer_stem or wafer_stem.lower() in {"device", "devices", "defect", "defects"}:
+        wafer_stem = json_file.parent.name.strip() or "wafer"
+    return Path(f"{wafer_stem}_subtracted_defects.gds")
+# <<< H2P WAFER-AWARE OUTPUT NAME <<<
+
+
+# >>> H2P BATCH MASK CLI V1 >>>
+def _is_none_value(value: object) -> bool:
+    return str(value or "").strip().lower() in {"", "none", "null"}
+
+
+def _batch_defect_json_path(
+    record: dict,
+    *,
+    base_dir: str | Path,
+) -> Path:
+    """Resolve one wafer's reviewed defect JSON from a batch record."""
+    configured = record.get("defect_json", "none")
+    if not _is_none_value(configured):
+        return Path(str(configured))
+
+    wafer_id = normalize_wafer_id(str(record["id"]))
+    return Path(base_dir) / wafer_id / f"{wafer_id}_device_defects.json"
+
+
+def _default_metadata_dir_for_json(json_path: str | Path) -> Path:
+    """Use the per-wafer metadata folder beside the reviewed JSON."""
+    return Path(json_path).parent / "metadata"
+
+
+def _clean_existing_output(path: Path, *, label: str, no_clean: bool) -> None:
+    if not path.exists() or no_clean:
+        return
+    if path.is_dir():
+        raise RuntimeError(f"Refusing to remove directory {label.lower()} path: {path}")
+    print(f"[Cleanup] Removing stale {label}: {path}")
+    path.unlink()
+
+
+def _run_subtraction_job(
+    *,
+    json_path: str | Path,
+    gds_path: str | Path,
+    output_path: str | Path,
+    report_path: str | Path | None,
+    metadata_dir: str | Path | None,
+    layers: Iterable[int],
+    error_angle_deg: float,
+    error_x_px: float,
+    error_y_px: float,
+    extra_margin_um: float,
+    wafer_center_x_um: float,
+    wafer_center_y_um: float,
+    no_error_compensation: bool,
+    strict_corners: bool,
+    precision: float,
+    no_report: bool,
+    no_clean: bool,
+) -> None:
+    json_path = Path(json_path)
+    output_path = Path(output_path)
+    report_path = (
+        Path(report_path)
+        if report_path is not None
+        else output_path.with_name(f"{output_path.stem}_removal_report.txt")
     )
-    parser.add_argument("json_path", nargs="?", help="Path to subtraction-ready defect JSON data")
-    parser.add_argument("--json", dest="json_opt", type=str, default=None, help="Path to subtraction-ready defect JSON data (legacy form)")
-    parser.add_argument("--gds", type=str, default="semiconductor_design.gds", help="Path to original GDS. Default: semiconductor_design.gds")
-    parser.add_argument("--out", type=str, default="Wafer_A_subtracted_defects.gds", help="Path to write modified output GDS. Default: Wafer_A_subtracted_defects.gds")
-    parser.add_argument("-l", "--layers", type=int, nargs="+", default=[1, 4], help="Target GDS layers for boolean subtraction, e.g. -l 1 4")
-    parser.add_argument("--error-angle-deg", type=float, default=DEFAULT_ALIGNMENT_ERROR_ANGLE_DEG, help="Worst-case residual rotation error in degrees; default: 0.001")
-    parser.add_argument("--error-x-px", type=float, default=DEFAULT_ALIGNMENT_ERROR_X_PX, help="Worst-case residual x registration error in crop pixels; default: 2")
-    parser.add_argument("--error-y-px", type=float, default=DEFAULT_ALIGNMENT_ERROR_Y_PX, help="Worst-case residual y registration error in crop pixels; default: 2")
-    parser.add_argument("--extra-margin-um", type=float, default=DEFAULT_EXTRA_MARGIN_UM, help="Additional fixed safety margin in GDS microns; default: 0")
-    parser.add_argument("--wafer-center-x-um", type=float, default=DEFAULT_WAFER_CENTER_X_UM, help="Wafer rotation center X in GDS microns for angle-error compensation; default: 0")
-    parser.add_argument("--wafer-center-y-um", type=float, default=DEFAULT_WAFER_CENTER_Y_UM, help="Wafer rotation center Y in GDS microns for angle-error compensation; default: 0")
-    parser.add_argument("--no-error-compensation", action="store_true", help="Disable conservative polygon expansion for alignment uncertainty")
-    parser.add_argument("--strict-corners", action="store_true", default=True, help="Fail instead of falling back when any defect is missing GDS geometry. Default: on")
-    parser.add_argument("--allow-legacy-geometry", action="store_false", dest="strict_corners", help="Allow legacy center/width/height defects without corners_gds/polygon_gds")
-    parser.add_argument("--precision", type=float, default=1e-3, help="GDS boolean/offset precision in microns; default: 1e-3")
-    parser.add_argument("--metadata-dir", type=str, default="extracted_cells/metadata", help="Per-cell extraction metadata directory used for accurate device area denominators")
-    parser.add_argument("--report", type=str, default=None, help="Removal report text path. Default: <output_gds_stem>_removal_report.txt")
-    parser.add_argument("--no-report", action="store_true", help="Do not write the per-device removal report")
-    parser.add_argument("--no-clean", action="store_true", help="Do not delete an existing output GDS before writing")
-    args = parser.parse_args()
+    metadata_dir = (
+        Path(metadata_dir)
+        if metadata_dir is not None
+        else _default_metadata_dir_for_json(json_path)
+    )
 
-    json_path = args.json_opt or args.json_path
-    if not json_path:
-        parser.error("missing defect JSON path. Example: python subtract_defects.py Wafer_A_device_defects.json -l 1 4")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if not no_report:
+        report_path.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"[Runtime] version={SUBTRACT_DEFECTS_VERSION}")
-    output_path = Path(args.out)
-    if output_path.exists() and not args.no_clean:
-        if output_path.is_dir():
-            raise RuntimeError(f"Refusing to remove directory output path: {output_path}")
-        print(f"[Cleanup] Removing stale output GDS: {output_path}")
-        output_path.unlink()
-
-    report_path = Path(args.report) if args.report else output_path.with_name(f"{output_path.stem}_removal_report.txt")
-    if report_path.exists() and not args.no_clean and not args.no_report:
-        if report_path.is_dir():
-            raise RuntimeError(f"Refusing to remove directory report path: {report_path}")
-        print(f"[Cleanup] Removing stale report: {report_path}")
-        report_path.unlink()
+    _clean_existing_output(output_path, label="output GDS", no_clean=no_clean)
+    if not no_report:
+        _clean_existing_output(report_path, label="report", no_clean=no_clean)
 
     subtract_defects_from_gds(
-        args.gds,
-        json_path,
-        args.out,
-        args.layers,
-        compensate_alignment_error=not args.no_error_compensation,
+        str(gds_path),
+        str(json_path),
+        str(output_path),
+        tuple(int(layer) for layer in layers),
+        compensate_alignment_error=not no_error_compensation,
+        error_angle_deg=error_angle_deg,
+        error_x_px=error_x_px,
+        error_y_px=error_y_px,
+        extra_margin_um=extra_margin_um,
+        wafer_center=(wafer_center_x_um, wafer_center_y_um),
+        strict_corners=strict_corners,
+        precision=precision,
+        metadata_dir=metadata_dir,
+        report_path=report_path,
+        write_report=not no_report,
+    )
+
+
+def _parse_cli_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Subtract reviewed defect regions from one wafer or every wafer in "
+            "batch_wafers.txt, then write per-device removed-area reports. "
+            "Batch mode is selected automatically when no defect JSON positional "
+            "argument is supplied."
+        )
+    )
+    parser.add_argument(
+        "json_path",
+        nargs="?",
+        help=(
+            "Path to one subtraction-ready defect JSON. Omit this argument to "
+            "process all wafers listed in --batch."
+        ),
+    )
+    parser.add_argument(
+        "--json",
+        dest="json_opt",
+        type=str,
+        default=None,
+        help="Path to one subtraction-ready defect JSON (legacy form)",
+    )
+    parser.add_argument(
+        "--batch",
+        type=str,
+        default="batch_wafers.txt",
+        help="Batch wafer definition file used when no JSON path is supplied",
+    )
+    parser.add_argument(
+        "--base",
+        type=str,
+        default="extracted_cells",
+        help="Base directory containing per-wafer extraction folders",
+    )
+    parser.add_argument(
+        "--wafer",
+        action="append",
+        default=[],
+        help=(
+            "In batch mode, process only this wafer. May be supplied multiple "
+            "times; names may include or omit the Wafer_ prefix."
+        ),
+    )
+    parser.add_argument(
+        "--gds",
+        type=str,
+        default="future_design.gds",
+        help="Path to original GDS. Default: future_design.gds",
+    )
+    parser.add_argument(
+        "--out",
+        type=str,
+        default=None,
+        help=(
+            "Single-wafer output GDS path. In batch mode this is allowed only "
+            "when exactly one wafer is selected."
+        ),
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=".",
+        help=(
+            "Batch output directory. Each wafer is written as "
+            "<Wafer_id>_subtracted_defects.gds. Default: current directory"
+        ),
+    )
+    parser.add_argument(
+        "-l",
+        "--layers",
+        type=int,
+        nargs="+",
+        default=[1, 4],
+        help="Target GDS layers for boolean subtraction, e.g. -l 1 4",
+    )
+    parser.add_argument(
+        "--error-angle-deg",
+        type=float,
+        default=DEFAULT_ALIGNMENT_ERROR_ANGLE_DEG,
+        help="Worst-case residual rotation error in degrees; default: 0.001",
+    )
+    parser.add_argument(
+        "--error-x-px",
+        type=float,
+        default=DEFAULT_ALIGNMENT_ERROR_X_PX,
+        help="Worst-case residual x registration error in crop pixels; default: 2",
+    )
+    parser.add_argument(
+        "--error-y-px",
+        type=float,
+        default=DEFAULT_ALIGNMENT_ERROR_Y_PX,
+        help="Worst-case residual y registration error in crop pixels; default: 2",
+    )
+    parser.add_argument(
+        "--extra-margin-um",
+        type=float,
+        default=DEFAULT_EXTRA_MARGIN_UM,
+        help="Additional fixed safety margin in GDS microns; default: 0",
+    )
+    parser.add_argument(
+        "--wafer-center-x-um",
+        type=float,
+        default=DEFAULT_WAFER_CENTER_X_UM,
+        help="Wafer rotation center X in GDS microns; default: 0",
+    )
+    parser.add_argument(
+        "--wafer-center-y-um",
+        type=float,
+        default=DEFAULT_WAFER_CENTER_Y_UM,
+        help="Wafer rotation center Y in GDS microns; default: 0",
+    )
+    parser.add_argument(
+        "--no-error-compensation",
+        action="store_true",
+        help="Disable conservative polygon expansion for alignment uncertainty",
+    )
+    parser.add_argument(
+        "--strict-corners",
+        action="store_true",
+        default=True,
+        help=(
+            "Fail instead of falling back when any defect is missing GDS "
+            "geometry. Default: on"
+        ),
+    )
+    parser.add_argument(
+        "--allow-legacy-geometry",
+        action="store_false",
+        dest="strict_corners",
+        help="Allow legacy center/width/height defects without GDS polygons",
+    )
+    parser.add_argument(
+        "--precision",
+        type=float,
+        default=1e-3,
+        help="GDS boolean/offset precision in microns; default: 1e-3",
+    )
+    parser.add_argument(
+        "--metadata-dir",
+        type=str,
+        default=None,
+        help=(
+            "Per-cell metadata directory. Default: the metadata folder beside "
+            "each wafer's reviewed JSON."
+        ),
+    )
+    parser.add_argument(
+        "--report",
+        type=str,
+        default=None,
+        help=(
+            "Single-wafer report path. In batch mode this is allowed only when "
+            "exactly one wafer is selected."
+        ),
+    )
+    parser.add_argument(
+        "--no-report",
+        action="store_true",
+        help="Do not write per-device removal reports",
+    )
+    parser.add_argument(
+        "--no-clean",
+        action="store_true",
+        help="Do not delete existing output files before writing",
+    )
+    parser.add_argument(
+        "--stop-on-error",
+        action="store_true",
+        help="In batch mode, stop immediately when one wafer fails",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show the batch jobs without creating masks",
+    )
+    return parser.parse_args()
+
+
+def _run_single_mode(args: argparse.Namespace, json_path: str | Path) -> int:
+    if args.wafer:
+        raise ValueError("--wafer is only valid when using batch mode.")
+    output_path = Path(args.out) if args.out else _default_subtracted_output_path(json_path)
+    print(f"[Runtime] version={SUBTRACT_DEFECTS_VERSION}")
+    print("[Mode] Single-wafer mask creation")
+    print(f"[Input] Defect JSON: {json_path}")
+    print(f"[Input] GDS: {args.gds}")
+    print(f"[Output] GDS: {output_path}")
+    if args.dry_run:
+        return 0
+
+    _run_subtraction_job(
+        json_path=json_path,
+        gds_path=args.gds,
+        output_path=output_path,
+        report_path=args.report,
+        metadata_dir=args.metadata_dir,
+        layers=args.layers,
         error_angle_deg=args.error_angle_deg,
         error_x_px=args.error_x_px,
         error_y_px=args.error_y_px,
         extra_margin_um=args.extra_margin_um,
-        wafer_center=(args.wafer_center_x_um, args.wafer_center_y_um),
+        wafer_center_x_um=args.wafer_center_x_um,
+        wafer_center_y_um=args.wafer_center_y_um,
+        no_error_compensation=args.no_error_compensation,
         strict_corners=args.strict_corners,
         precision=args.precision,
-        metadata_dir=args.metadata_dir,
-        report_path=report_path,
-        write_report=not args.no_report,
+        no_report=args.no_report,
+        no_clean=args.no_clean,
     )
+    return 0
+
+
+def _run_batch_mode(args: argparse.Namespace) -> int:
+    records = parse_batch_file(args.batch)
+    wafer_ids = select_wafer_ids(records, args.wafer)
+    selected_keys = {wafer_id.casefold() for wafer_id in wafer_ids}
+    selected_records = [
+        record
+        for record in records
+        if normalize_wafer_id(str(record["id"])).casefold() in selected_keys
+    ]
+
+    if not selected_records:
+        raise ValueError("No wafers were selected from the batch file.")
+    if len(selected_records) > 1 and args.out:
+        raise ValueError("--out cannot represent multiple batch outputs; use --output-dir.")
+    if len(selected_records) > 1 and args.report:
+        raise ValueError("--report cannot represent multiple batch reports; use default names.")
+    if len(selected_records) > 1 and args.metadata_dir:
+        raise ValueError(
+            "--metadata-dir cannot represent multiple wafer metadata folders. "
+            "Place metadata beside each reviewed JSON or select one --wafer."
+        )
+
+    output_dir = Path(args.output_dir)
+    total = len(selected_records)
+    failures: list[tuple[str, str]] = []
+    attempted = 0
+    succeeded = 0
+    print(f"[Runtime] version={SUBTRACT_DEFECTS_VERSION}")
+    print(f"[Mode] Batch mask creation from {args.batch}")
+    print(f"[Batch] Selected wafers: {', '.join(wafer_ids)}")
+    print(f"[Batch] Input GDS: {args.gds}")
+    print(f"[Batch] Target layers: {', '.join(str(v) for v in args.layers)}")
+
+    batch_bar = ProgressBar("Batch masks", total)
+    for index, record in enumerate(selected_records, start=1):
+        attempted += 1
+        wafer_id = normalize_wafer_id(str(record["id"]))
+        json_path = _batch_defect_json_path(record, base_dir=args.base)
+        output_path = (
+            Path(args.out)
+            if args.out
+            else output_dir / f"{wafer_id}_subtracted_defects.gds"
+        )
+        report_path = (
+            Path(args.report)
+            if args.report
+            else output_path.with_name(f"{output_path.stem}_removal_report.txt")
+        )
+        metadata_dir = (
+            Path(args.metadata_dir)
+            if args.metadata_dir
+            else _default_metadata_dir_for_json(json_path)
+        )
+
+        print("\n" + "=" * 72)
+        print(f" MASK RUN [{index}/{total}]: {wafer_id}")
+        print("=" * 72)
+        print(f"[{wafer_id}] Defect JSON: {json_path}")
+        print(f"[{wafer_id}] Metadata: {metadata_dir}")
+        print(f"[{wafer_id}] Output GDS: {output_path}")
+        if not args.no_report:
+            print(f"[{wafer_id}] Removal report: {report_path}")
+
+        if args.dry_run:
+            succeeded += 1
+            batch_bar.update(index, extra=f"planned {wafer_id}", force=True)
+            continue
+
+        try:
+            _run_subtraction_job(
+                json_path=json_path,
+                gds_path=args.gds,
+                output_path=output_path,
+                report_path=report_path,
+                metadata_dir=metadata_dir,
+                layers=args.layers,
+                error_angle_deg=args.error_angle_deg,
+                error_x_px=args.error_x_px,
+                error_y_px=args.error_y_px,
+                extra_margin_um=args.extra_margin_um,
+                wafer_center_x_um=args.wafer_center_x_um,
+                wafer_center_y_um=args.wafer_center_y_um,
+                no_error_compensation=args.no_error_compensation,
+                strict_corners=args.strict_corners,
+                precision=args.precision,
+                no_report=args.no_report,
+                no_clean=args.no_clean,
+            )
+        except KeyboardInterrupt:
+            print(f"\n[{wafer_id}] Interrupted by user.", flush=True)
+            raise
+        except Exception as exc:
+            failures.append((wafer_id, str(exc)))
+            print(f"[{wafer_id}] ERROR: {exc}", flush=True)
+            batch_bar.update(index, extra=f"FAILED {wafer_id}", force=True)
+            if args.stop_on_error:
+                break
+            continue
+
+        succeeded += 1
+        batch_bar.update(index, extra=f"completed {wafer_id}", force=True)
+
+    unprocessed = total - attempted
+    batch_bar.done(
+        extra=(
+            f"succeeded {succeeded}/{total}; failed {len(failures)}; "
+            f"unprocessed {unprocessed}"
+        )
+    )
+    print("\n" + "=" * 72)
+    if args.dry_run:
+        print(" BATCH MASK PLAN COMPLETE")
+        return 0
+    if failures:
+        print(" BATCH MASK CREATION COMPLETE WITH FAILURES")
+        for wafer_id, error in failures:
+            print(f" - {wafer_id}: {error}")
+        return 1
+    print(" BATCH MASK CREATION COMPLETE")
+    return 0
+
+
+def main() -> int:
+    args = _parse_cli_args()
+    if args.json_opt and args.json_path and Path(args.json_opt) != Path(args.json_path):
+        raise ValueError("Provide either the positional JSON path or --json, not both.")
+    json_path = args.json_opt or args.json_path
+    if json_path:
+        return _run_single_mode(args, json_path)
+    return _run_batch_mode(args)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("\n[Interrupted] Mask creation stopped by user.", flush=True)
+        raise SystemExit(130)

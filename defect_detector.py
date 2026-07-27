@@ -4890,6 +4890,10 @@ def launch_review_ui(
     # The review UI edits annotations_json in place. Once it closes, rebuild a
     # GDS-positioned wafer overview from the final reviewed JSON so retained
     # automatic polygons and manually added regions appear together.
+    print(
+        "[Review UI] Review saved. Building reviewed-wafer stitch, masks, and report...",
+        flush=True,
+    )
     try:
         from reviewed_defect_wafer_stitch import build_reviewed_wafer_stitch
 
@@ -4903,13 +4907,17 @@ def launch_review_ui(
             "[Reviewed Wafer Stitch] Saved: "
             f"{reviewed_stitch['outputs']['composite']}"
         )
+    except KeyboardInterrupt:
+        print(
+            "\n[Reviewed Wafer Stitch] Skipped by user. "
+            "Reviewed labels remain saved.",
+            flush=True,
+        )
     except Exception as exc:
-        # Do not destroy reviewed labels just because overview generation fails.
         print(
             "[Reviewed Wafer Stitch] WARNING: "
-            f"overview generation failed: {exc}"
+            f"overview generation failed: {exc}. Reviewed labels remain saved."
         )
-
 
 # ---------------------------------------------------------------------------
 # CLI

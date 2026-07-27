@@ -3714,6 +3714,10 @@ def install_future_design_adapter(pipeline: Any) -> None:
     pipeline.wafer_metrology.generate_downscaled_stitch = generate_downscaled_stitch_shared
     pipeline.wafer_metrology.detect_wafer_on_canvas = detect_wafer_on_canvas_shared
     pipeline.large_wafer_tester.LargeWaferTester = FutureMarkerReviewTester
+    # >>> H2P ALIGNMENT MARKER UI UPGRADE >>>
+    from alignment_marker_ui_upgrade import install_alignment_marker_ui_upgrade
+    install_alignment_marker_ui_upgrade(pipeline)
+    # <<< H2P ALIGNMENT MARKER UI UPGRADE <<<
     pipeline._resolve_alignment_from_centroid_tester = resolve_future_alignment
     # Deliberately leave wafer_align_gui.run_manual_alignment untouched.  The
     # production pipeline now opens it with the reviewed automatic/manual marker

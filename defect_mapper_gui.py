@@ -14,8 +14,9 @@ This file provides two compatible tools:
    output can be passed directly to subtract_defects.py.
 
 Controls:
-    Left drag             draw new defect box
-    Right click box       delete the clicked box
+    Left drag             draw rectangle or freehand lasso
+    B / F                 rectangle / freehand lasso mode
+    Right click shape     delete the clicked annotation
     1..5                  choose defect type after drawing (standard mode)
     --quick-review         new boxes use generic "defect" with no type prompt
     N / Right / Space     next cell
@@ -74,7 +75,7 @@ RIGHT_ARROW_CODES = [2555904, 65363, 83, 0x270000, 63235]
 UP_ARROW_CODES = [2490368, 65362, 82, 0x260000, 63232]
 DOWN_ARROW_CODES = [2621440, 65364, 84, 0x280000, 63233]
 
-GUI_VERSION = "fast-untyped-review-v8-2026-07-14"
+GUI_VERSION = "manual-polygon-review-v9-2026-07-23"
 WINDOW_NAME = "Device Defect Register"
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 
@@ -346,6 +347,9 @@ class _BaseDefectReviewUI:
         self.drawing = False
         self.start_pt = (0, 0)
         self.current_pt = (0, 0)
+        self.draw_mode = "rectangle"
+        self.lasso_points: list[tuple[int, int]] = []
+        self.draw_mode_button_bounds: dict[str, tuple[int, int, int, int]] = {}
         self.is_waiting_for_key = False
         self.undo_stack: list[dict] = []
         self.redo_stack: list[dict] = []
@@ -678,6 +682,85 @@ class _BaseDefectReviewUI:
         orig_y2 = max(0, min(int(round(max(self.start_pt[1], self.current_pt[1]) * scale_up_y)), self.native_h))
         return orig_x1, orig_y1, orig_x2, orig_y2
 
+    def _display_polygon_to_native(self, points: list[tuple[int, int]]) -> list[list[int]]:
+        """Convert display-space lasso vertices to native crop pixels."""
+        if not points:
+            return []
+        scale_up_x = self.native_w / float(max(self.display_width, 1))
+        scale_up_y = self.native_h / float(max(self.display_height, 1))
+        native: list[list[int]] = []
+        for x, y in points:
+            nx = max(0, min(int(round(float(x) * scale_up_x)), self.native_w - 1))
+            ny = max(0, min(int(round(float(y) * scale_up_y)), self.native_h - 1))
+            if not native or native[-1] != [nx, ny]:
+                native.append([nx, ny])
+        if len(native) > 1 and native[0] == native[-1]:
+            native.pop()
+        return native
+
+    def _record_from_native_polygon(self, entry: dict, polygon_px: list[list[int]], assigned_class: str) -> dict:
+        """Create a subtraction-compatible record while preserving an exact lasso."""
+        pts = np.asarray(polygon_px, dtype=np.float32).reshape(-1, 2)
+        if len(pts) < 3:
+            raise ValueError("A lasso requires at least three vertices")
+        x, y, w, h = cv2.boundingRect(np.rint(pts).astype(np.int32))
+        record = self._record_from_native_bbox(entry, [int(x), int(y), int(w), int(h)], assigned_class)
+
+        meta = entry.get("metadata") or {}
+        if meta:
+            canvas_to_gds = _metadata_canvas_to_gds_affine(meta)
+            polygon_gds = [_round_pair(crop_px_to_gds(float(px), float(py), meta, canvas_to_gds)) for px, py in pts]
+            moments = cv2.moments(pts.reshape(-1, 1, 2))
+            if abs(float(moments.get("m00", 0.0))) > 1e-9:
+                cx_px = float(moments["m10"] / moments["m00"])
+                cy_px = float(moments["m01"] / moments["m00"])
+            else:
+                cx_px, cy_px = map(float, pts.mean(axis=0))
+            center_x_um, center_y_um = crop_px_to_gds(cx_px, cy_px, meta, canvas_to_gds)
+        else:
+            transformer = getattr(self, "transformer", None)
+            cell_data = entry.get("cell_data")
+            if transformer is None or cell_data is None:
+                raise RuntimeError(f"Cannot map lasso for {entry.get('filename', 'image')}: missing GDS transform metadata")
+            polygon_gds = [
+                _round_pair(transformer.crop_pixel_to_gds(float(px), float(py), cell_data, shave=self.shave, pad=self.pad))
+                for px, py in pts
+            ]
+            moments = cv2.moments(pts.reshape(-1, 1, 2))
+            if abs(float(moments.get("m00", 0.0))) > 1e-9:
+                cx_px = float(moments["m10"] / moments["m00"])
+                cy_px = float(moments["m01"] / moments["m00"])
+            else:
+                cx_px, cy_px = map(float, pts.mean(axis=0))
+            center_x_um, center_y_um = transformer.crop_pixel_to_gds(
+                cx_px, cy_px, cell_data, shave=self.shave, pad=self.pad
+            )
+
+        xs = [float(point[0]) for point in polygon_gds]
+        ys = [float(point[1]) for point in polygon_gds]
+        record.update(
+            {
+                "polygon_px": [[int(round(px)), int(round(py))] for px, py in pts],
+                "polygon_gds": polygon_gds,
+                "center_x_um": round(float(center_x_um), 3),
+                "center_y_um": round(float(center_y_um), 3),
+                "width_um": round(float(max(xs) - min(xs)), 3),
+                "height_um": round(float(max(ys) - min(ys)), 3),
+                "source": "manual_review_lasso",
+            }
+        )
+        return record
+
+    def _set_draw_mode(self, mode: str) -> None:
+        mode = str(mode).lower()
+        if mode not in {"rectangle", "lasso"}:
+            return
+        self.draw_mode = mode
+        self.drawing = False
+        self.lasso_points = []
+        self.redraw_canvas()
+        self._status(f"Drawing mode: {mode}")
+
     def _record_from_native_bbox(self, entry: dict, bbox_px: list[int], assigned_class: str) -> dict:
         raise NotImplementedError
 
@@ -692,12 +775,19 @@ class _BaseDefectReviewUI:
         native_x = x * self.native_w / float(self.display_width)
         native_y = y * self.native_h / float(self.display_height)
         for idx in range(len(anns) - 1, -1, -1):
-            box = anns[idx].get("box_px") or anns[idx].get("bbox_px")
-            if not box or len(box) < 4:
-                continue
-            bx, by, bw, bh = [float(v) for v in box[:4]]
-            pad = 3.0
-            if bx - pad <= native_x <= bx + bw + pad and by - pad <= native_y <= by + bh + pad:
+            ann = anns[idx]
+            polygon = ann.get("polygon_px") or []
+            hit = False
+            if len(polygon) >= 3:
+                pts = np.asarray(polygon, dtype=np.float32).reshape(-1, 1, 2)
+                hit = cv2.pointPolygonTest(pts, (float(native_x), float(native_y)), True) >= -3.0
+            if not hit:
+                box = ann.get("box_px") or ann.get("bbox_px")
+                if box and len(box) >= 4:
+                    bx, by, bw, bh = [float(v) for v in box[:4]]
+                    pad = 3.0
+                    hit = bx - pad <= native_x <= bx + bw + pad and by - pad <= native_y <= by + bh + pad
+            if hit:
                 self.push_undo()
                 removed = anns.pop(idx)
                 self._mark_annotations_dirty(filename)
@@ -722,27 +812,46 @@ class _BaseDefectReviewUI:
         cv2.putText(self.canvas, "DEVICE DEFECT REVIEW", (self.display_width + 15, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1, cv2.LINE_AA)
         cv2.putText(self.canvas, f"Index: {self.current_idx + 1} / {len(self.cell_files)}", (self.display_width + 15, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
         cv2.putText(self.canvas, f"File: {filename}", (self.display_width + 15, 84), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (220, 220, 220), 1, cv2.LINE_AA)
-        cv2.putText(self.canvas, f"Boxes: {len(self.annotations.get(filename, []))}", (self.display_width + 15, 106), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (220, 220, 220), 1, cv2.LINE_AA)
+        cv2.putText(self.canvas, f"Shapes: {len(self.annotations.get(filename, []))}", (self.display_width + 15, 106), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (220, 220, 220), 1, cv2.LINE_AA)
+
+        # Two explicit modes keep polygon creation discoverable without stealing
+        # image-space mouse gestures from existing rectangle users.
+        button_y1, button_y2 = 118, 151
+        left = self.display_width + 15
+        gap = 10
+        button_w = (self.panel_width - 40) // 2
+        self.draw_mode_button_bounds = {
+            "rectangle": (left, button_y1, left + button_w, button_y2),
+            "lasso": (left + button_w + gap, button_y1, left + 2 * button_w + gap, button_y2),
+        }
+        for mode, bounds in self.draw_mode_button_bounds.items():
+            x1, y1, x2, y2 = bounds
+            active = self.draw_mode == mode
+            fill = (0, 125, 190) if active else (65, 65, 65)
+            border = (0, 255, 255) if active else (130, 130, 130)
+            cv2.rectangle(self.canvas, (x1, y1), (x2, y2), fill, -1)
+            cv2.rectangle(self.canvas, (x1, y1), (x2, y2), border, 1)
+            label = "RECTANGLE" if mode == "rectangle" else "LASSO"
+            text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)[0]
+            tx = x1 + max(4, (x2 - x1 - text_size[0]) // 2)
+            cv2.putText(self.canvas, label, (tx, y1 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (250, 250, 250), 1, cv2.LINE_AA)
 
         controls = [
-            "Drag: add generic defect" if self.quick_label else "Drag: add box",
-            "Right-click box: delete",
-            "No type prompt (quick mode)" if self.quick_label else "1-5: type after drawing",
-            "N/Space/Right: next",
-            "P/Left: previous",
+            "Drag image; B/F switches rectangle/lasso",
+            "Right-click deletes; 1-5 assigns type" if not self.quick_label else "Right-click deletes; generic quick type",
+            "N/P/Left/Right/Space: navigate",
             "Up/Down: same-column row jump",
-            "C: clear current cell",
-            "X: exclude/current damaged",
-            "L: toggle text labels",
-            "Ctrl+Z: undo",
-            "Ctrl+Shift+Z or Ctrl+Y: redo",
-            "K or COPY: copy current image",
-            "Q/Esc: quit/save & quit",
+            "C/X: clear/exclude    L/K: labels/copy",
+            "Ctrl+Z / Ctrl+Y: undo / redo",
+            "Q/Esc: save and quit",
         ]
-        y0 = 136
-        cv2.putText(self.canvas, "CONTROLS:", (self.display_width + 15, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+        # Give the mode buttons a little more breathing room before the
+        # controls legend.  This is deliberately a small visual shift only.
+        y0 = 173
+        cv2.putText(self.canvas, "CONTROLS:", (self.display_width + 15, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1, cv2.LINE_AA)
         for i, line in enumerate(controls):
-            cv2.putText(self.canvas, line, (self.display_width + 15, y0 + 22 + 18 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (220, 220, 220), 1, cv2.LINE_AA)
+            cv2.putText(self.canvas, line, (self.display_width + 15, y0 + 20 + 15 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.32, (220, 220, 220), 1, cv2.LINE_AA)
+        self.controls_bottom_y = y0 + 20 + 15 * len(controls) + 1
 
         self._draw_cell_map()
         self._draw_copy_button()
@@ -857,11 +966,11 @@ class _BaseDefectReviewUI:
 
         # Keep the map low enough that the temporary defect-type chooser can
         # live in the blank space above it without covering the map.
-        map_size, map_padding = 220, 13
+        map_size = 190 if self.display_height < 700 else 220
+        map_padding = 11 if map_size < 220 else 13
         map_draw_size = map_size - 2 * map_padding
         map_x_start = self.display_width + 40
-        preferred_map_y = max(500, self.display_height - map_size - 10)
-        map_y_start = min(preferred_map_y, max(330, self.display_height - map_size - 10))
+        map_y_start = max(330, self.display_height - map_size - 10)
         cv2.rectangle(self.canvas, (map_x_start - 10, map_y_start - 10), (map_x_start + map_size - 10, map_y_start + map_size - 10), (30, 30, 30), -1)
         cv2.rectangle(self.canvas, (map_x_start - 10, map_y_start - 10), (map_x_start + map_size - 10, map_y_start + map_size - 10), (100, 100, 100), 1)
         self.cell_map_outer_bounds = (map_x_start - 10, map_y_start - 10, map_x_start + map_size - 10, map_y_start + map_size - 10)
@@ -972,20 +1081,19 @@ class _BaseDefectReviewUI:
         """
         x0 = self.display_width + 14
         x1 = self.display_width + self.panel_width - 14
-        card_h = 132
+        card_h = 128
 
-        # Controls block starts at y=136. Keep the chooser below it.
-        controls_bottom = 136 + 22 + 18 * 11 + 18
+        # Keep the chooser below the compact controls and above the minimap.
+        controls_bottom = int(getattr(self, "controls_bottom_y", 382))
 
-        map_size = 220
-        preferred_map_y = max(500, self.display_height - map_size - 10)
-        map_y_start = min(preferred_map_y, max(330, self.display_height - map_size - 10))
+        map_size = 190 if self.display_height < 700 else 220
+        map_y_start = max(330, self.display_height - map_size - 10)
         max_y0_without_map_overlap = map_y_start - card_h - 12
 
         if max_y0_without_map_overlap >= controls_bottom:
             y0 = controls_bottom
         else:
-            y0 = min(max(controls_bottom, 330), max(0, self.display_height - card_h - 8))
+            y0 = min(controls_bottom, max(0, self.display_height - card_h - 8))
         y1 = min(self.display_height - 8, y0 + card_h)
         return int(x0), int(y0), int(x1), int(y1)
 
@@ -1073,6 +1181,11 @@ class _BaseDefectReviewUI:
             return
         if event == cv2.EVENT_LBUTTONDOWN:
             if x >= self.display_width:
+                for mode, bounds in self.draw_mode_button_bounds.items():
+                    bx1, by1, bx2, by2 = bounds
+                    if bx1 <= x <= bx2 and by1 <= y <= by2:
+                        self._set_draw_mode(mode)
+                        return
                 cb = getattr(self, "copy_button_bounds", None)
                 if cb is not None:
                     bx1, by1, bx2, by2 = cb
@@ -1088,45 +1201,90 @@ class _BaseDefectReviewUI:
                         return
             else:
                 self.drawing = True
-                self.start_pt = (max(0, min(x, self.display_width - 1)), max(0, min(y, self.display_height - 1)))
-                self.current_pt = self.start_pt
+                point = (max(0, min(x, self.display_width - 1)), max(0, min(y, self.display_height - 1)))
+                self.start_pt = point
+                self.current_pt = point
+                self.lasso_points = [point] if self.draw_mode == "lasso" else []
         elif event == cv2.EVENT_MOUSEMOVE and self.drawing:
             clamped_x = max(0, min(x, self.display_width - 1))
             clamped_y = max(0, min(y, self.display_height - 1))
             self.current_pt = (clamped_x, clamped_y)
+            if self.draw_mode == "lasso":
+                last = self.lasso_points[-1] if self.lasso_points else self.current_pt
+                if math.hypot(clamped_x - last[0], clamped_y - last[1]) >= 2.5:
+                    self.lasso_points.append(self.current_pt)
             now = time.perf_counter()
             if now - self._last_drag_present < (1.0 / 60.0):
                 return
             self._last_drag_present = now
             temp = self.canvas.copy()
-            cv2.rectangle(temp, self.start_pt, self.current_pt, (0, 255, 255), 2, cv2.LINE_8)
+            if self.draw_mode == "lasso" and len(self.lasso_points) >= 2:
+                pts = np.asarray(self.lasso_points, dtype=np.int32).reshape(-1, 1, 2)
+                cv2.polylines(temp, [pts], False, (0, 255, 255), 2, cv2.LINE_AA)
+                if len(pts) >= 3:
+                    cv2.line(temp, tuple(pts[-1, 0]), tuple(pts[0, 0]), (0, 150, 180), 1, cv2.LINE_AA)
+            else:
+                cv2.rectangle(temp, self.start_pt, self.current_pt, (0, 255, 255), 2, cv2.LINE_8)
             cv2.imshow(WINDOW_NAME, temp)
         elif event == cv2.EVENT_LBUTTONUP and self.drawing:
             self.drawing = False
             clamped_x = max(0, min(x, self.display_width - 1))
             clamped_y = max(0, min(y, self.display_height - 1))
             self.current_pt = (clamped_x, clamped_y)
-            w_disp = abs(self.current_pt[0] - self.start_pt[0])
-            h_disp = abs(self.current_pt[1] - self.start_pt[1])
-            if w_disp < 4 or h_disp < 4:
-                self.redraw_canvas()
-                return
-            temp = self.canvas.copy()
-            cv2.rectangle(temp, self.start_pt, self.current_pt, (0, 165, 255), 3)
-            cv2.imshow(WINDOW_NAME, temp)
+
+            display_polygon: list[tuple[int, int]] | None = None
+            if self.draw_mode == "lasso":
+                if not self.lasso_points or self.lasso_points[-1] != self.current_pt:
+                    self.lasso_points.append(self.current_pt)
+                if len(self.lasso_points) >= 3:
+                    raw = np.asarray(self.lasso_points, dtype=np.int32).reshape(-1, 1, 2)
+                    perimeter = cv2.arcLength(raw, True)
+                    simplified = cv2.approxPolyDP(raw, max(1.2, 0.003 * perimeter), True).reshape(-1, 2)
+                    if len(simplified) >= 3 and abs(cv2.contourArea(simplified.astype(np.float32))) >= 16.0:
+                        display_polygon = [(int(px), int(py)) for px, py in simplified]
+                if display_polygon is None:
+                    self.lasso_points = []
+                    self.redraw_canvas()
+                    return
+                temp = self.canvas.copy()
+                preview = np.asarray(display_polygon, dtype=np.int32).reshape(-1, 1, 2)
+                overlay = temp.copy()
+                cv2.fillPoly(overlay, [preview], (0, 110, 135))
+                cv2.addWeighted(overlay, 0.22, temp, 0.78, 0.0, temp)
+                cv2.polylines(temp, [preview], True, (0, 165, 255), 3, cv2.LINE_AA)
+                cv2.imshow(WINDOW_NAME, temp)
+            else:
+                w_disp = abs(self.current_pt[0] - self.start_pt[0])
+                h_disp = abs(self.current_pt[1] - self.start_pt[1])
+                if w_disp < 4 or h_disp < 4:
+                    self.redraw_canvas()
+                    return
+                temp = self.canvas.copy()
+                cv2.rectangle(temp, self.start_pt, self.current_pt, (0, 165, 255), 3)
+                cv2.imshow(WINDOW_NAME, temp)
+
             assigned_class = self.default_defect_type if self.quick_label else self._prompt_for_defect_type()
             if assigned_class is not None:
-                orig_x1, orig_y1, orig_x2, orig_y2 = self._display_to_native_rect()
-                if orig_x2 > orig_x1 and orig_y2 > orig_y1:
-                    entry = self.cell_files[self.current_idx]
-                    self.push_undo()
-                    record = self._record_from_native_bbox(
-                        entry,
-                        [orig_x1, orig_y1, orig_x2 - orig_x1, orig_y2 - orig_y1],
-                        assigned_class,
-                    )
-                    self.annotations.setdefault(entry["filename"], []).append(record)
-                    self._mark_annotations_dirty(entry["filename"])
+                entry = self.cell_files[self.current_idx]
+                if display_polygon is not None:
+                    native_polygon = self._display_polygon_to_native(display_polygon)
+                    if len(native_polygon) >= 3 and abs(cv2.contourArea(np.asarray(native_polygon, dtype=np.float32))) >= 8.0:
+                        self.push_undo()
+                        record = self._record_from_native_polygon(entry, native_polygon, assigned_class)
+                        self.annotations.setdefault(entry["filename"], []).append(record)
+                        self._mark_annotations_dirty(entry["filename"])
+                else:
+                    orig_x1, orig_y1, orig_x2, orig_y2 = self._display_to_native_rect()
+                    if orig_x2 > orig_x1 and orig_y2 > orig_y1:
+                        self.push_undo()
+                        record = self._record_from_native_bbox(
+                            entry,
+                            [orig_x1, orig_y1, orig_x2 - orig_x1, orig_y2 - orig_y1],
+                            assigned_class,
+                        )
+                        self.annotations.setdefault(entry["filename"], []).append(record)
+                        self._mark_annotations_dirty(entry["filename"])
+            self.lasso_points = []
             self.redraw_canvas()
 
 
@@ -1246,6 +1404,12 @@ class _BaseDefectReviewUI:
             return False
         if key in DOWN_ARROW_CODES:
             self._jump_by_grid_row(1)
+            return False
+        if key8 in (ord("b"), ord("B")):
+            self._set_draw_mode("rectangle")
+            return False
+        if key8 in (ord("f"), ord("F")):
+            self._set_draw_mode("lasso")
             return False
         if key8 in (ord("x"), ord("X")):
             filename = self.cell_files[self.current_idx]["filename"]

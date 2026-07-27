@@ -335,6 +335,142 @@ def _rotate_masks(local_masks: dict[str, np.ndarray], matrix, local_w: int, loca
     }
 
 
+
+# >>> H2P_DEVICE_ZOOM_CORRECTION_V1 >>>
+DEFAULT_DEVICE_ZOOM_X = 1.0377104590638329
+DEFAULT_DEVICE_ZOOM_Y = 1.0714417075665796
+DEFAULT_DEVICE_BOTTOM_TRIM_PX = 14
+# H2P_DEVICE_BOTTOM_TRIM_V3: bottom trimming remains available, but is opt-in.
+# H2P_DEVICE_CROP_OPT_IN_V1: default extraction applies neither measured zoom nor bottom trim.
+
+
+def _normalize_device_crop_cli(args, parser=None) -> None:
+    """Resolve the opt-in device crop switches into the legacy internal fields.
+
+    Default: no measured zoom and zero bottom trim.
+    --zoom: enable the measured X/Y crop using DEFAULT_DEVICE_ZOOM_X/Y.
+    --trim: enable DEFAULT_DEVICE_BOTTOM_TRIM_PX without implicitly enabling zoom.
+    The older low-level options remain available for explicit overrides.
+    """
+    zoom_requested = bool(getattr(args, "zoom", False))
+    force_no_zoom = bool(getattr(args, "no_device_zoom", False))
+    if zoom_requested and force_no_zoom:
+        message = "--zoom and --no-device-zoom cannot be used together"
+        if parser is not None:
+            parser.error(message)
+        raise ValueError(message)
+
+    # Existing extraction code reads args.no_device_zoom. Make the new default
+    # equivalent to passing --no-device-zoom, and let --zoom opt back in.
+    args.no_device_zoom = not zoom_requested
+
+    requested_trim = getattr(args, "device_bottom_trim_px", None)
+    if requested_trim is None:
+        requested_trim = (
+            DEFAULT_DEVICE_BOTTOM_TRIM_PX
+            if bool(getattr(args, "trim", False))
+            else 0
+        )
+    requested_trim = int(round(float(requested_trim)))
+    if requested_trim < 0:
+        message = f"device bottom trim must be >= 0 pixels, got {requested_trim}"
+        if parser is not None:
+            parser.error(message)
+        raise ValueError(message)
+    args.device_bottom_trim_px = requested_trim
+
+
+def _apply_device_zoom_to_bounds(
+    crop_bounds: tuple[int, int, int, int],
+    *,
+    enabled: bool,
+    zoom_x: float,
+    zoom_y: float,
+    bottom_trim_px: int = 0,
+    max_width: int,
+    max_height: int,
+) -> tuple[tuple[int, int, int, int], dict]:
+    """Optionally apply measured zoom and/or an independent bottom-only trim.
+
+    Both operations are crops, never resizes, so source pixels and seam masks
+    remain registered. Zoom is centered. Bottom trim preserves the top edge.
+    """
+    x1, y1, x2, y2 = (int(v) for v in crop_bounds)
+    max_width = max(1, int(max_width))
+    max_height = max(1, int(max_height))
+    x1 = max(0, min(x1, max_width - 1))
+    y1 = max(0, min(y1, max_height - 1))
+    x2 = max(x1 + 1, min(x2, max_width))
+    y2 = max(y1 + 1, min(y2, max_height))
+
+    input_w = x2 - x1
+    input_h = y2 - y1
+    zx = float(zoom_x)
+    zy = float(zoom_y)
+    requested_bottom_trim = int(round(float(bottom_trim_px)))
+
+    if not math.isfinite(zx) or zx < 1.0:
+        raise ValueError(f"device zoom X must be finite and >= 1.0, got {zoom_x!r}")
+    if not math.isfinite(zy) or zy < 1.0:
+        raise ValueError(f"device zoom Y must be finite and >= 1.0, got {zoom_y!r}")
+    if requested_bottom_trim < 0:
+        raise ValueError(
+            f"device bottom trim must be >= 0 pixels, got {bottom_trim_px!r}"
+        )
+
+    zoom_applied = bool(enabled) and not (
+        abs(zx - 1.0) < 1e-12 and abs(zy - 1.0) < 1e-12
+    )
+    if zoom_applied:
+        target_w = max(16, min(input_w, int(round(input_w / zx))))
+        target_h = max(16, min(input_h, int(round(input_h / zy))))
+    else:
+        target_w = input_w
+        target_h = input_h
+
+    trim_x = input_w - target_w
+    trim_y = input_h - target_h
+    trim_left = trim_x // 2
+    trim_right = trim_x - trim_left
+    trim_top = trim_y // 2
+    trim_bottom = trim_y - trim_top
+
+    applied_bottom_trim = min(
+        requested_bottom_trim,
+        max(0, target_h - 16),
+    )
+    output_h = target_h - applied_bottom_trim
+    trim_bottom += applied_bottom_trim
+
+    result = (
+        x1 + trim_left,
+        y1 + trim_top,
+        x2 - trim_right,
+        y2 - trim_bottom,
+    )
+    metadata = {
+        "enabled": bool(zoom_applied or applied_bottom_trim),
+        "applied": bool(trim_x or trim_y or applied_bottom_trim),
+        "zoom_enabled": bool(enabled),
+        "zoom_applied": zoom_applied,
+        "trim_enabled": bool(requested_bottom_trim),
+        "zoom_x": zx,
+        "zoom_y": zy,
+        "bottom_trim_px": applied_bottom_trim,
+        "requested_bottom_trim_px": requested_bottom_trim,
+        "input_size_px": [input_w, input_h],
+        "output_size_px": [target_w, output_h],
+        "trim_px": {
+            "left": trim_left,
+            "right": trim_right,
+            "top": trim_top,
+            "bottom": trim_bottom,
+        },
+    }
+    return result, metadata
+
+
+# <<< H2P_DEVICE_ZOOM_CORRECTION_V1 <<<
 def _save_crop_artifacts(
     *,
     out_dir: Path,
@@ -608,6 +744,17 @@ def _extract_fast_crops_from_downscaled_canvas(
             progress.update(idx, extra=f"skip {row}-{col}")
             continue
 
+        (crop_x1, crop_y1, crop_x2, crop_y2), device_zoom_metadata = _apply_device_zoom_to_bounds(
+            (crop_x1, crop_y1, crop_x2, crop_y2),
+            enabled=not bool(getattr(args, 'no_device_zoom', False)),
+            zoom_x=float(getattr(args, 'device_zoom_x', DEFAULT_DEVICE_ZOOM_X)),
+            zoom_y=float(getattr(args, 'device_zoom_y', DEFAULT_DEVICE_ZOOM_Y)),
+            bottom_trim_px=int(getattr(
+                args, "device_bottom_trim_px", DEFAULT_DEVICE_BOTTOM_TRIM_PX
+            )),
+            max_width=local_w,
+            max_height=local_h,
+        )
         cell_crop = rotated_local_canvas[crop_y1:crop_y2, crop_x1:crop_x2]
         cell_crop, rotated_local_masks, final_bounds, resize_scale = _resize_crop_and_masks_if_needed(
             cell_crop=cell_crop,
@@ -645,6 +792,7 @@ def _extract_fast_crops_from_downscaled_canvas(
             "seam_mask": str((mask_dir / f"{cell_stem}_seam_mask.png").as_posix()),
         }
 
+        metadata["device_zoom"] = dict(device_zoom_metadata)
         _save_crop_artifacts(
             out_dir=out_dir,
             preview_dir=preview_dir,
@@ -1034,6 +1182,17 @@ def process_wafer_cells(folder, json_file, config, args, wafer_id):
             if crop_x2 <= crop_x1 or crop_y2 <= crop_y1:
                 continue
 
+            (crop_x1, crop_y1, crop_x2, crop_y2), device_zoom_metadata = _apply_device_zoom_to_bounds(
+                (crop_x1, crop_y1, crop_x2, crop_y2),
+                enabled=not bool(getattr(args, 'no_device_zoom', False)),
+                zoom_x=float(getattr(args, 'device_zoom_x', DEFAULT_DEVICE_ZOOM_X)),
+                zoom_y=float(getattr(args, 'device_zoom_y', DEFAULT_DEVICE_ZOOM_Y)),
+                bottom_trim_px=int(getattr(
+                    args, "device_bottom_trim_px", DEFAULT_DEVICE_BOTTOM_TRIM_PX
+                )),
+                max_width=local_w,
+                max_height=local_h,
+            )
             cell_crop = rotated_local_canvas[crop_y1:crop_y2, crop_x1:crop_x2]
             boundary_metadata = {
                 "enabled": bool(getattr(args, "bound", False)),
@@ -1076,6 +1235,16 @@ def process_wafer_cells(folder, json_file, config, args, wafer_id):
                     crop_y1 = 0
                     crop_x2 = int(cell_crop.shape[1])
                     crop_y2 = int(cell_crop.shape[0])
+                    device_zoom_metadata = {
+                        'enabled': not bool(getattr(args, 'no_device_zoom', False)),
+                        'applied': False,
+                        'reason': 'physical_boundary_alignment_applied',
+                        'zoom_x': float(getattr(args, 'device_zoom_x', DEFAULT_DEVICE_ZOOM_X)),
+                        'zoom_y': float(getattr(args, 'device_zoom_y', DEFAULT_DEVICE_ZOOM_Y)),
+                        'input_size_px': [int(cell_crop.shape[1]), int(cell_crop.shape[0])],
+                        'output_size_px': [int(cell_crop.shape[1]), int(cell_crop.shape[0])],
+                        'trim_px': {'left': 0, 'right': 0, 'top': 0, 'bottom': 0},
+                    }
                 else:
                     print(
                         f"\n[{out_stem} Bound] Cell {row}-{col}: "
@@ -1112,6 +1281,7 @@ def process_wafer_cells(folder, json_file, config, args, wafer_id):
                 else "native_gds_fallback"
             )
 
+            metadata["device_zoom"] = dict(device_zoom_metadata)
             _save_crop_artifacts(
                 out_dir=out_dir,
                 preview_dir=preview_dir,
@@ -1215,6 +1385,12 @@ def main():
     parser.add_argument("--no-manual", action="store_true", help="Do not launch manual alignment GUI in simple -c mode")
     parser.add_argument("--no-clean", action="store_true", help="Keep existing output folder instead of deleting it before -c")
     parser.add_argument("--shave", type=int, default=10, help="Crop outer buffer width inside rotated cell frame")
+    parser.add_argument("--zoom", action="store_true", help="Enable the measured centered device crop zoom. Default: off")
+    parser.add_argument("--trim", action="store_true", help="Trim 14 pixels from the bottom of each cell crop. Default: off")
+    parser.add_argument("--device-zoom-x", type=float, default=DEFAULT_DEVICE_ZOOM_X, help="Zoom X used by --zoom. Default: 1.037710")
+    parser.add_argument("--device-zoom-y", type=float, default=DEFAULT_DEVICE_ZOOM_Y, help="Zoom Y used by --zoom. Default: 1.071442")
+    parser.add_argument("--device-bottom-trim-px", type=int, default=None, help="Explicit bottom trim in pixels. Overrides --trim; default: 0 (14 with --trim)")
+    parser.add_argument("--no-device-zoom", action="store_true", help="Force-disable measured zoom; retained for compatibility")
     parser.add_argument("--out-dir", type=str, default="extracted_cells", help="Target output subdirectory to store cropped files")
     parser.add_argument("-d", "--device", action="store_true", help="Enable defect inspection annotation dashboard review")
     parser.add_argument("-c", "--create", action="store_true", help="Stage 1: Generate native cropped die formats")
@@ -1339,7 +1515,20 @@ def main():
     args = parser.parse_args()
     print(f"[Runtime] version={WAFER_EXTRACTION_VERSION}")
     _apply_simple_create_defaults(args)
+    _normalize_device_crop_cli(args, parser)
 
+    if args.create:
+        if args.no_device_zoom:
+            print('[Extraction] Physical-device crop zoom: disabled (use --zoom to enable)')
+        else:
+            print(
+                '[Extraction] Physical-device crop zoom: ' 
+                f'x={args.device_zoom_x:.6f}, y={args.device_zoom_y:.6f}'
+            )
+        if int(args.device_bottom_trim_px) > 0:
+            print(f'[Extraction] Device bottom trim: {int(args.device_bottom_trim_px)} px')
+        else:
+            print('[Extraction] Device bottom trim: disabled (use --trim to enable)')
     try:
         config = load_config("config.json")
     except Exception as e:
