@@ -171,7 +171,7 @@ The main files are:
 18. reviewed_defect_wafer_stitch.py         Creates reviewed wafer-level images
 19. device_index_defect_viewer.py           Cross-wafer device-index inspection UI
 
-20. subtract_defects.py                     Stage 4 GDS subtraction
+20. subtract_defects.py                     Stage 3 GDS subtraction
 21. batch_wafers_parser.py                  Compact and legacy batch-file parser
 22. wafer_run_layout.py                     Per-wafer output path helpers
 23. h2p_progress.py                         Shared command-line progress reporting
