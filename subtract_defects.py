@@ -119,6 +119,62 @@ def _scale_polygon_about_centroid(points: np.ndarray, margin_um: float) -> np.nd
     return centroid + vectors * scale
 
 
+def apply_reconnection_shunts(polygons, layer, datatype, precision=1e-3):
+    """
+    Analyzes cut gridlines and adds horizontal shunt paths to ensure electrical
+    connectivity back to the busbars.
+    """
+    if not polygons:
+        return []
+
+    # 1. Basic properties of your grid (Adjust based on your GDS units/microns)
+    # These can be estimated by looking at the polygon widths/spacing
+    all_bboxes = [p.bounding_box() for p in polygons]
+    finger_widths = [b[1][0] - b[0][0] for b in all_bboxes]
+    avg_width = np.median(finger_widths)
+    
+    # Estimate pitch by looking at X-centers of adjacent polygons
+    x_centers = sorted([ (b[0][0] + b[1][0])/2 for b in all_bboxes ])
+    diffs = np.diff(x_centers)
+    avg_pitch = np.median(diffs[diffs > avg_width*2]) # Ignore fragments in same col
+
+    new_shunts = []
+
+    # 2. Find "Dead Ends"
+    # A dead end is a vertex created by the subtraction operation that 
+    # doesn't touch the original top/bottom boundary.
+    for poly in polygons:
+        bbox = poly.bounding_box()
+        min_x, min_y = bbox[0]
+        max_x, max_y = bbox[1]
+        
+        # Determine if this is a vertical finger segment
+        if (max_y - min_y) > (max_x - min_x):
+            # Create a shunt at the top and bottom of every segment
+            # We draw them 90 degrees (horizontally)
+            # We extend by avg_pitch to ensure we hit the next line
+            
+            # Shunt at Top of segment
+            shunt_top = gdstk.rectangle(
+                (min_x, max_y - avg_width), 
+                (min_x + avg_pitch + avg_width, max_y),
+                layer=layer, datatype=datatype
+            )
+            
+            # Shunt at Bottom of segment
+            shunt_bot = gdstk.rectangle(
+                (min_x, min_y), 
+                (min_x + avg_pitch + avg_width, min_y + avg_width),
+                layer=layer, datatype=datatype
+            )
+            
+            new_shunts.extend([shunt_top, shunt_bot])
+
+    # 3. Join shunts with existing polygons
+    # Use 'union' to merge the new bridges into the existing grid
+    return gdstk.boolean(polygons, new_shunts, "or", precision=precision, layer=layer, datatype=datatype)
+
+
 def expand_defect_polygon_for_alignment_error(
     points: np.ndarray,
     margin_um: float,
@@ -696,22 +752,19 @@ def subtract_defects_from_gds(
             start=1,
         ):
             if layer in target_layers_set:
-                print(
-                    f" -> Cutting defect regions from Layer {layer}, Datatype {datatype} "
-                    f"({len(layer_polys)} polys)..."
-                )
-                subtracted = gdstk.boolean(
-                    layer_polys,
-                    defect_polygons,
-                    "not",
-                    precision=precision,
-                    layer=layer,
-                    datatype=datatype,
-                )
+                print(f" -> Cutting defect regions from Layer {layer}...")
+                subtracted = gdstk.boolean(layer_polys, defect_polygons, "not", precision=precision, layer=layer, datatype=datatype)
+        
+                # --- NEW RECONNECTION LOGIC START ---
+                # Assuming Layer 3 is your gridline layer
+                if layer == 3: 
+                    print(f" -> Applying 90-degree shunts to Layer {layer} to fix isolation...")
+                    subtracted = apply_reconnection_shunts(subtracted, layer, datatype, precision)
+                # --- NEW RECONNECTION LOGIC END ---
                 final_polygons.extend(subtracted)
             else:
                 final_polygons.extend(layer_polys)
-            _h2p_mask_bar.update(
+                _h2p_mask_bar.update(
                 _h2p_group_index,
                 extra=f"processed layer {layer}/{datatype}",
                 force=True,
