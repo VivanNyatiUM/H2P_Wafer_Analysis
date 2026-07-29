@@ -176,14 +176,13 @@ The main files are:
 22. wafer_run_layout.py                     Per-wafer output path helpers
 23. h2p_progress.py                         Shared command-line progress reporting
 24. migrate_combined_extracted_cells.py     Migrates older combined extraction output
-25. copy_tiles.py                           Optional tile-copying utility
 
-26. config.json                             Geometry and stitching configuration
-27. batch_wafers.txt                        Compact wafer-name list
-28. future_design.gds                       Active future-design GDS
-29. semiconductor_design.gds                Legacy GDS used by the old workflow
+25. config.json                             Geometry and stitching configuration
+26. batch_wafers.txt                        Compact wafer-name list
+27. future_design.gds                       Active future-design GDS
+28. semiconductor_design.gds                Legacy GDS used by the old workflow
 
-30. assets\h2pLogo.png                      H2P logo used by the device viewer
+29. assets\h2pLogo.png                      H2P logo used by the device viewer
 ```
 
 ## Configuration
