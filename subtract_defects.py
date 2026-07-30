@@ -119,60 +119,119 @@ def _scale_polygon_about_centroid(points: np.ndarray, margin_um: float) -> np.nd
     return centroid + vectors * scale
 
 
-def apply_reconnection_shunts(polygons, layer, datatype, precision=1e-3):
-    """
-    Analyzes cut gridlines and adds horizontal shunt paths to ensure electrical
-    connectivity back to the busbars.
-    """
+def apply_smart_shunts(polygons, defect_polygons, layer, datatype, precision=1e-3):
     if not polygons:
         return []
 
-    # 1. Basic properties of your grid (Adjust based on your GDS units/microns)
-    # These can be estimated by looking at the polygon widths/spacing
-    all_bboxes = [p.bounding_box() for p in polygons]
-    finger_widths = [b[1][0] - b[0][0] for b in all_bboxes]
-    avg_width = np.median(finger_widths)
+    # 1. Extract segment data
+    segments = []
+    for p in polygons:
+        bbox = p.bounding_box()
+        # bbox is ((min_x, min_y), (max_x, max_y))
+        w = bbox[1][0] - bbox[0][0]
+        h = bbox[1][1] - bbox[0][1]
+        
+        # Only process vertical-ish segments
+        if h > w:
+            segments.append({
+                'x_mid': (bbox[0][0] + bbox[1][0]) / 2,
+                'x_min': bbox[0][0],
+                'x_max': bbox[1][0],
+                'y_min': bbox[0][1],
+                'y_max': bbox[1][1],
+                'poly': p
+            })
+
+    if not segments:
+        return polygons
+
+    # 2. Estimate grid properties
+    # Use a set to get unique X positions to calculate pitch accurately
+    unique_xs = sorted(list(set([round(s['x_mid'], 2) for s in segments])))
+    if len(unique_xs) > 1:
+        avg_pitch = np.median(np.diff(unique_xs))
+    else:
+        avg_pitch = 100.0 # Fallback if only one line exists
+        
+    avg_width = np.median([s['x_max'] - s['x_min'] for s in segments])
     
-    # Estimate pitch by looking at X-centers of adjacent polygons
-    x_centers = sorted([ (b[0][0] + b[1][0])/2 for b in all_bboxes ])
-    diffs = np.diff(x_centers)
-    avg_pitch = np.median(diffs[diffs > avg_width*2]) # Ignore fragments in same col
+    # Range to look for a neighbor (up to 2.5 times the pitch)
+    search_range = avg_pitch * 2.5 
+    # Vertical "forgiveness" - looks for a neighbor within this Y-distance of the cut end
+    y_tolerance = 5.0 
 
     new_shunts = []
 
-    # 2. Find "Dead Ends"
-    # A dead end is a vertex created by the subtraction operation that 
-    # doesn't touch the original top/bottom boundary.
-    for poly in polygons:
-        bbox = poly.bounding_box()
-        min_x, min_y = bbox[0]
-        max_x, max_y = bbox[1]
-        
-        # Determine if this is a vertical finger segment
-        if (max_y - min_y) > (max_x - min_x):
-            # Create a shunt at the top and bottom of every segment
-            # We draw them 90 degrees (horizontally)
-            # We extend by avg_pitch to ensure we hit the next line
+    for seg in segments:
+        # Try to shunt from both the top and the bottom of every cut segment
+        for y_level in [seg['y_min'], seg['y_max']]:
             
-            # Shunt at Top of segment
-            shunt_top = gdstk.rectangle(
-                (min_x, max_y - avg_width), 
-                (min_x + avg_pitch + avg_width, max_y),
-                layer=layer, datatype=datatype
-            )
-            
-            # Shunt at Bottom of segment
-            shunt_bot = gdstk.rectangle(
-                (min_x, min_y), 
-                (min_x + avg_pitch + avg_width, min_y + avg_width),
-                layer=layer, datatype=datatype
-            )
-            
-            new_shunts.extend([shunt_top, shunt_bot])
+            best_neighbor_x = None
+            min_dist = float('inf')
+            direction = 0 # 1 for right, -1 for left
 
-    # 3. Join shunts with existing polygons
-    # Use 'union' to merge the new bridges into the existing grid
-    return gdstk.boolean(polygons, new_shunts, "or", precision=precision, layer=layer, datatype=datatype)
+            for other in segments:
+                # Skip self
+                if abs(other['x_mid'] - seg['x_mid']) < 0.1:
+                    continue
+                
+                # Check if this neighbor is within horizontal search range
+                dist_x = other['x_mid'] - seg['x_mid']
+                if abs(dist_x) > search_range:
+                    continue
+
+                # Robust Y-Overlap Check:
+                # Does the neighbor exist at this Y level (with a small tolerance)?
+                if other['y_min'] - y_tolerance <= y_level <= other['y_max'] + y_tolerance:
+                    if abs(dist_x) < min_dist:
+                        min_dist = abs(dist_x)
+                        best_neighbor_x = other['x_mid']
+                        direction = 1 if dist_x > 0 else -1
+
+            # 3. Create the shunt if a neighbor was found
+            if direction != 0:
+                # OLD LOGIC: x_end = best_neighbor_x (stops at the center)
+                # IMPROVED LOGIC: 
+                # We start from the center of the current segment 
+                # and end at the center of the neighbor segment.
+                # This ensures a massive overlap and a guaranteed connection.
+                
+                x_start = seg['x_mid'] 
+                x_end = best_neighbor_x
+                
+                # Center the shunt vertically on the cut point
+                shunt_y_min = y_level - (avg_width / 2)
+                
+                shunt = gdstk.rectangle(
+                    (x_start, shunt_y_min),
+                    (x_end, shunt_y_min + avg_width),
+                    layer=layer, datatype=datatype
+                )
+                new_shunts.append(shunt)
+
+    if not new_shunts:
+        return polygons
+
+    # NEW: Clip the shunts so they do not cross into defect areas
+    # This removes any part of a shunt that overlaps with a defect blob
+    valid_shunts = gdstk.boolean(
+        new_shunts, 
+        defect_polygons, 
+        "not", 
+        precision=precision, 
+        layer=layer, 
+        datatype=datatype
+    )
+
+    # Union the clipped shunts with the original gridlines
+    return gdstk.boolean(
+        polygons, 
+        valid_shunts, 
+        "or", 
+        precision=precision*10, 
+        layer=layer, 
+        datatype=datatype
+    )
 
 
 def expand_defect_polygon_for_alignment_error(
@@ -752,15 +811,53 @@ def subtract_defects_from_gds(
             start=1,
         ):
             if layer in target_layers_set:
-                print(f" -> Cutting defect regions from Layer {layer}...")
-                subtracted = gdstk.boolean(layer_polys, defect_polygons, "not", precision=precision, layer=layer, datatype=datatype)
-        
-                # --- NEW RECONNECTION LOGIC START ---
-                # Assuming Layer 3 is your gridline layer
-                if layer == 3: 
-                    print(f" -> Applying 90-degree shunts to Layer {layer} to fix isolation...")
-                    subtracted = apply_reconnection_shunts(subtracted, layer, datatype, precision)
-                # --- NEW RECONNECTION LOGIC END ---
+                # --- ROBUST LOGIC FOR LAYER 3 ---
+                if layer == 3:
+                    print(f" -> Separating Borders and Fingers for Layer {layer}...")
+                    
+                    # 1. Determine typical finger width
+                    # We take the median width of all polygons to find the "standard" finger size
+                    all_widths = sorted([p.bounding_box()[1][0] - p.bounding_box()[0][0] for p in layer_polys])
+                    typical_finger_width = np.median(all_widths)
+                    print(f"    - Detected typical finger width: {typical_finger_width:.3f}um")
+
+                    fingers = []
+                    borders = []
+                    
+                    # 2. Refined Classification
+                    for p in layer_polys:
+                        bbox = p.bounding_box()
+                        w = bbox[1][0] - bbox[0][0]
+                        h = bbox[1][1] - bbox[0][1]
+                        
+                        # A FINGER is narrow (close to typical width) AND vertically oriented (height > width)
+                        # A BORDER is either:
+                        #  a) Horizontal (Width > Height)
+                        #  b) Thick (Width is significantly larger than a gridline)
+                        is_narrow = w < (typical_finger_width * 1.5)
+                        is_vertical = h > w
+                        
+                        if is_narrow and is_vertical:
+                            fingers.append(p)
+                        else:
+                            # This catches fractured busbar segments and vertical frame bars
+                            borders.append(p)
+                    
+                    print(f"    - Classified {len(borders)} polygons as Protected Border.")
+                    print(f"    - Classified {len(fingers)} polygons as Gridline Fingers.")
+
+                    # 3. Process Fingers (Cut defects + Apply shunts)
+                    subtracted_fingers = gdstk.boolean(fingers, defect_polygons, "not", precision=precision, layer=layer, datatype=datatype)
+                    fixed_fingers = apply_smart_shunts(subtracted_fingers, defect_polygons, layer, datatype, precision)
+
+                    # 4. RECOMBINE (Border is preserved 100%)
+                    subtracted = gdstk.boolean(fixed_fingers, borders, "or", precision=precision*10, layer=layer, datatype=datatype)
+
+                else:
+                    # Standard logic for other layers
+                    print(f" -> Cutting defect regions from Layer {layer}...")
+                    subtracted = gdstk.boolean(layer_polys, defect_polygons, "not", precision=precision, layer=layer, datatype=datatype)
+                
                 final_polygons.extend(subtracted)
             else:
                 final_polygons.extend(layer_polys)
