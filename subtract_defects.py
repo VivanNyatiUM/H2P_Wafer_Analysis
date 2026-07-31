@@ -3,6 +3,7 @@ import re
 import json
 import math
 import argparse
+import tempfile
 from pathlib import Path
 from typing import Iterable
 
@@ -12,6 +13,22 @@ from h2p_progress import ProgressBar
 from batch_wafers_parser import parse_batch_file
 from wafer_run_layout import normalize_wafer_id, select_wafer_ids
 
+try:
+    from remove_hanging_gridlines import (
+        find_hanging_boundaries,
+        infer_cells,
+        parse_flat_gds,
+        write_filtered_gds,
+    )
+except (ImportError, SystemExit) as exc:  # Delayed error unless cleanup is enabled.
+    find_hanging_boundaries = None
+    infer_cells = None
+    parse_flat_gds = None
+    write_filtered_gds = None
+    _GRIDLINE_CLEANUP_IMPORT_ERROR = exc
+else:
+    _GRIDLINE_CLEANUP_IMPORT_ERROR = None
+
 # >>> H2P SUBTRACTION PROGRESS V2 >>>
 
 DEFAULT_ALIGNMENT_ERROR_ANGLE_DEG = 0.001
@@ -20,7 +37,7 @@ DEFAULT_ALIGNMENT_ERROR_Y_PX = 2.0
 DEFAULT_EXTRA_MARGIN_UM = 0.0
 DEFAULT_WAFER_CENTER_X_UM = 0.0
 DEFAULT_WAFER_CENTER_Y_UM = 0.0
-SUBTRACT_DEFECTS_VERSION = "tight-mask-removal-report-v2-2026-07-13"
+SUBTRACT_DEFECTS_VERSION = "post-gridline-cleanup-report-v3-2026-07-31"
 
 
 def _polygon_signed_area(points: np.ndarray) -> float:
@@ -503,115 +520,316 @@ def _device_defects_for_record(
     return out
 
 
+
+def _group_polygons_by_layer_type(
+    polygons: Iterable[gdstk.Polygon],
+) -> dict[tuple[int, int], list[gdstk.Polygon]]:
+    grouped: dict[tuple[int, int], list[gdstk.Polygon]] = {}
+    for polygon in polygons:
+        grouped.setdefault((polygon.layer, polygon.datatype), []).append(polygon)
+    return grouped
+
+
+def _read_flat_polygons_by_layer_type(
+    gds_path: str | Path,
+) -> dict[tuple[int, int], list[gdstk.Polygon]]:
+    """Read the final flat GDS and group polygons by layer/datatype."""
+    lib = gdstk.read_gds(str(gds_path))
+    top_cells = lib.top_level()
+    if not top_cells:
+        raise ValueError(f"No top-level cells found in final GDS: {gds_path}")
+    polygons = top_cells[0].get_polygons(apply_repetitions=True)
+    return _group_polygons_by_layer_type(polygons)
+
+
+def run_hanging_gridline_cleanup(
+    *,
+    input_gds: str | Path,
+    output_gds: str | Path,
+    target_layer: int = 3,
+    reference_layer: int = 7,
+    span_fraction: float = 0.60,
+    report_path: str | Path | None = None,
+    logical_input_path: str | Path | None = None,
+) -> dict:
+    """Apply remove_hanging_gridlines.py to an already-flat subtraction result."""
+    if _GRIDLINE_CLEANUP_IMPORT_ERROR is not None:
+        raise RuntimeError(
+            "Hanging-gridline cleanup is enabled, but remove_hanging_gridlines.py "
+            "could not be imported. Keep it beside subtract_defects.py and ensure "
+            "Shapely is installed."
+        ) from _GRIDLINE_CLEANUP_IMPORT_ERROR
+
+    input_gds = Path(input_gds)
+    output_gds = Path(output_gds)
+    if input_gds.resolve() == output_gds.resolve():
+        raise ValueError("Gridline-cleanup input and output paths must be different")
+
+    print(
+        f"[CLEANUP] Removing hanging layer-{target_layer} gridlines "
+        f"using reference layer {reference_layer}..."
+    )
+    cleanup_lib = gdstk.read_gds(str(input_gds))
+    if cleanup_lib.unit <= 0 or cleanup_lib.precision <= 0:
+        raise ValueError("Invalid GDS unit/precision for gridline cleanup")
+    dbu_to_user_unit = cleanup_lib.precision / cleanup_lib.unit
+
+    parsed = parse_flat_gds(input_gds)
+    cells, x_pitch, y_pitch = infer_cells(parsed.boundaries, reference_layer)
+    removed, cell_reports, outside_count = find_hanging_boundaries(
+        parsed.boundaries,
+        cells,
+        target_layer=target_layer,
+        x_pitch=x_pitch,
+        y_pitch=y_pitch,
+        span_fraction=span_fraction,
+    )
+    write_filtered_gds(parsed, output_gds, removed)
+
+    for entry in cell_reports:
+        center_dbu = entry.get("center_dbu", [0.0, 0.0])
+        entry["center_user"] = [
+            float(center_dbu[0]) * dbu_to_user_unit,
+            float(center_dbu[1]) * dbu_to_user_unit,
+        ]
+
+    report = {
+        "input_gds": str(logical_input_path or input_gds),
+        "output_gds": str(output_gds),
+        "target_layer": int(target_layer),
+        "reference_layer": int(reference_layer),
+        "span_fraction": float(span_fraction),
+        "cell_count": len(cells),
+        "cell_pitch_dbu": [x_pitch, y_pitch],
+        "dbu_to_user_unit": dbu_to_user_unit,
+        "cell_pitch_user": [x_pitch * dbu_to_user_unit, y_pitch * dbu_to_user_unit],
+        "removed_boundary_count": len(removed),
+        "unchanged_target_boundaries_outside_cells": outside_count,
+        "cells_with_removals": sum(
+            1 for entry in cell_reports if entry["removed_boundary_count"] > 0
+        ),
+        "fallback_cell_count": sum(
+            1 for entry in cell_reports if entry["fallback_used"]
+        ),
+        "cells": cell_reports,
+    }
+
+    if report_path is not None:
+        cleanup_report_path = Path(report_path)
+        cleanup_report_path.parent.mkdir(parents=True, exist_ok=True)
+        cleanup_report_path.write_text(
+            json.dumps(report, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        print(f"[CLEANUP] Cleanup report saved to: {cleanup_report_path}")
+
+    print(
+        f"[CLEANUP] Detected {len(cells)} cells and removed "
+        f"{len(removed)} hanging layer-{target_layer} BOUNDARY elements."
+    )
+    return report
+
+
+def _point_in_polygon(point: tuple[float, float], polygon: gdstk.Polygon) -> bool:
+    """Return True when a point is inside or on the edge of a device footprint."""
+    x, y = point
+    points = np.asarray(polygon.points, dtype=np.float64)
+    if len(points) < 3:
+        return False
+
+    inside = False
+    j = len(points) - 1
+    for i in range(len(points)):
+        xi, yi = points[i]
+        xj, yj = points[j]
+
+        edge = np.array([xj - xi, yj - yi], dtype=np.float64)
+        rel = np.array([x - xi, y - yi], dtype=np.float64)
+        cross = abs(float(edge[0] * rel[1] - edge[1] * rel[0]))
+        if cross <= 1e-9:
+            dot = float(np.dot(rel, edge))
+            edge_len_sq = float(np.dot(edge, edge))
+            if -1e-9 <= dot <= edge_len_sq + 1e-9:
+                return True
+
+        intersects = ((yi > y) != (yj > y)) and (
+            x < (xj - xi) * (y - yi) / ((yj - yi) or 1e-300) + xi
+        )
+        if intersects:
+            inside = not inside
+        j = i
+    return inside
+
+
+def _cleanup_removed_for_device(record: dict, cleanup_summary: dict | None) -> int:
+    if not cleanup_summary:
+        return 0
+
+    device_polygon = record.get("polygon")
+    if device_polygon is not None:
+        spatial_matches = []
+        for entry in cleanup_summary.get("cells", []):
+            center = entry.get("center_user")
+            if isinstance(center, (list, tuple)) and len(center) >= 2:
+                point = (float(center[0]), float(center[1]))
+                if _point_in_polygon(point, device_polygon):
+                    spatial_matches.append(entry)
+        if len(spatial_matches) == 1:
+            return int(spatial_matches[0].get("removed_boundary_count", 0))
+
+    # Compatibility fallback for older cleanup summaries without center_user.
+    try:
+        row = int(record.get("row"))
+        col = int(record.get("col"))
+    except (TypeError, ValueError):
+        return 0
+    for entry in cleanup_summary.get("cells", []):
+        try:
+            if int(entry.get("row")) == row and int(entry.get("column")) == col:
+                return int(entry.get("removed_boundary_count", 0))
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
 def create_removal_report(
     *,
     report_path: str | Path,
     metadata_dir: str | Path,
     defects_data: dict,
     defects_by_device: dict[str, list[gdstk.Polygon]],
-    polys_by_layer_type: dict[tuple[int, int], list[gdstk.Polygon]],
-    target_layers: set[int],
+    original_polys_by_layer_type: dict[tuple[int, int], list[gdstk.Polygon]],
+    final_polys_by_layer_type: dict[tuple[int, int], list[gdstk.Polygon]],
+    report_layers: set[int],
     precision: float,
     gds_path: str,
     json_path: str,
     output_path: str,
     compensate_alignment_error: bool,
+    cleanup_summary: dict | None = None,
 ) -> Path:
-    """Write per-device and aggregate removed-area percentages.
+    """Write per-device removal percentages for the actual final output GDS.
 
-    Denominator: original geometry area on the selected target layers inside the
-    exact GDS footprint of each extracted device cell.
-
-    Numerator: the portion of that geometry intersected by the final expanded
-    defect polygons used for subtraction.  Overlapping defect polygons are counted
-    once because gdstk boolean operations union the set before area measurement.
+    Denominator: original geometry on all reported layers inside each exact device
+    footprint. Numerator: original geometry absent from the final post-cleanup GDS.
+    This includes both defect subtraction and hanging-gridline cleanup while
+    ignoring newly added shunt area.
     """
     report_path = Path(report_path)
     report_path.parent.mkdir(parents=True, exist_ok=True)
 
     devices, warnings = load_device_metadata(metadata_dir, defects_data)
-    selected_groups = {
-        key: polys for key, polys in polys_by_layer_type.items() if key[0] in target_layers
+    selected_original = {
+        key: polys
+        for key, polys in original_polys_by_layer_type.items()
+        if key[0] in report_layers
     }
 
     rows: list[dict] = []
-    # H2P_PROGRESS_REPORT_DEVICES_V2
-    _h2p_sorted_devices = sorted(devices.items(), key=lambda kv: (kv[1].get('row') if kv[1].get('row') is not None else 10 ** 9, kv[1].get('col') if kv[1].get('col') is not None else 10 ** 9, kv[0]))
-    _h2p_report_bar = ProgressBar(
-        "Removal report: devices",
-        len(_h2p_sorted_devices),
+    sorted_devices = sorted(
+        devices.items(),
+        key=lambda kv: (
+            kv[1].get("row") if kv[1].get("row") is not None else 10**9,
+            kv[1].get("col") if kv[1].get("col") is not None else 10**9,
+            kv[0],
+        ),
     )
-    for _h2p_device_index, (canonical, record) in enumerate(
-        _h2p_sorted_devices,
-        start=1,
-    ):
+    report_bar = ProgressBar("Removal report: devices", len(sorted_devices))
+    for device_index, (canonical, record) in enumerate(sorted_devices, start=1):
         device_window = record["polygon"]
         device_defects = _device_defects_for_record(record, defects_by_device)
+        cleanup_removed_boundaries = _cleanup_removed_for_device(record, cleanup_summary)
         per_layer: dict[int, dict[str, float]] = {}
         total_original = 0.0
+        total_remaining_original = 0.0
         total_removed = 0.0
 
-        for (layer, datatype), layer_polys in selected_groups.items():
-            inside = gdstk.boolean(
-                layer_polys,
+        for (layer, datatype), original_layer_polys in selected_original.items():
+            original_inside = gdstk.boolean(
+                original_layer_polys,
                 [device_window],
                 "and",
                 precision=precision,
                 layer=layer,
                 datatype=datatype,
             )
-            original_area = _polygon_area_sum(inside)
+            original_area = _polygon_area_sum(original_inside)
             removed_area = 0.0
-            if inside and device_defects:
-                removed = gdstk.boolean(
-                    inside,
-                    device_defects,
-                    "and",
-                    precision=precision,
-                    layer=layer,
-                    datatype=datatype,
-                )
-                removed_area = min(original_area, _polygon_area_sum(removed))
+            remaining_original_area = original_area
 
-            entry = per_layer.setdefault(layer, {"original": 0.0, "removed": 0.0})
+            final_layer_polys = final_polys_by_layer_type.get((layer, datatype), [])
+            if original_inside:
+                if final_layer_polys:
+                    removed_original = gdstk.boolean(
+                        original_inside,
+                        final_layer_polys,
+                        "not",
+                        precision=precision,
+                        layer=layer,
+                        datatype=datatype,
+                    )
+                    removed_area = min(original_area, _polygon_area_sum(removed_original))
+                else:
+                    removed_area = original_area
+                remaining_original_area = max(0.0, original_area - removed_area)
+
+            entry = per_layer.setdefault(
+                layer,
+                {"original": 0.0, "remaining": 0.0, "removed": 0.0},
+            )
             entry["original"] += original_area
+            entry["remaining"] += remaining_original_area
             entry["removed"] += removed_area
             total_original += original_area
+            total_remaining_original += remaining_original_area
             total_removed += removed_area
 
-        percent = 100.0 * total_removed / total_original if total_original > 1e-12 else float("nan")
-        rows.append({
-            "name": record["display_name"],
-            "canonical": canonical,
-            "defect_polygon_count": len(device_defects),
-            "original": total_original,
-            "removed": total_removed,
-            "percent": percent,
-            "layers": per_layer,
-        })
-        _h2p_report_bar.update(
-            _h2p_device_index,
+        percent = (
+            100.0 * total_removed / total_original
+            if total_original > 1e-12
+            else float("nan")
+        )
+        rows.append(
+            {
+                "name": record["display_name"],
+                "canonical": canonical,
+                "defect_polygon_count": len(device_defects),
+                "cleanup_removed_boundaries": cleanup_removed_boundaries,
+                "original": total_original,
+                "remaining": total_remaining_original,
+                "removed": total_removed,
+                "percent": percent,
+                "layers": per_layer,
+            }
+        )
+        report_bar.update(
+            device_index,
             extra=str(record.get("display_name", canonical)),
         )
-    _h2p_report_bar.done(
-        extra=f"calculated {len(rows)} devices",
+    report_bar.done(extra=f"calculated {len(rows)} devices")
+
+    valid_rows = [row for row in rows if np.isfinite(row["percent"])]
+    mean_percent = (
+        float(np.mean([row["percent"] for row in valid_rows]))
+        if valid_rows
+        else float("nan")
+    )
+    total_original = float(sum(row["original"] for row in valid_rows))
+    total_remaining = float(sum(row["remaining"] for row in valid_rows))
+    total_removed = float(sum(row["removed"] for row in valid_rows))
+    weighted_percent = (
+        100.0 * total_removed / total_original
+        if total_original > 1e-12
+        else float("nan")
     )
 
-    valid_rows = [r for r in rows if np.isfinite(r["percent"])]
-    mean_percent = float(np.mean([r["percent"] for r in valid_rows])) if valid_rows else float("nan")
-    total_original = float(sum(r["original"] for r in valid_rows))
-    total_removed = float(sum(r["removed"] for r in valid_rows))
-    weighted_percent = 100.0 * total_removed / total_original if total_original > 1e-12 else float("nan")
-
-    # Mention JSON devices that had no matching metadata.  Their masks are still
-    # subtracted globally, but a trustworthy device percentage needs a denominator.
     metadata_aliases = set()
     for record in devices.values():
         metadata_aliases.update(record.get("aliases", set()))
     unmatched = sorted(
-        _normalize_device_key(k)
-        for k, v in defects_data.items()
-        if isinstance(v, list) and _normalize_device_key(k) not in metadata_aliases
+        _normalize_device_key(key)
+        for key, value in defects_data.items()
+        if isinstance(value, list) and _normalize_device_key(key) not in metadata_aliases
     )
     if unmatched:
         warnings.append(
@@ -619,74 +837,116 @@ def create_removal_report(
             "their per-device percentage could not be calculated."
         )
 
+    cleanup_enabled = cleanup_summary is not None
     lines: list[str] = []
-    lines.append("GDS DEFECT MASK REMOVAL REPORT")
-    lines.append("=" * 78)
+    lines.append("FINAL GDS DEVICE REMOVAL REPORT")
+    lines.append("=" * 92)
     lines.append(f"Input GDS: {gds_path}")
     lines.append(f"Defect JSON: {json_path}")
-    lines.append(f"Output GDS: {output_path}")
-    lines.append(f"Target layers: {', '.join(str(v) for v in sorted(target_layers))}")
-    lines.append(f"Alignment-error expansion included: {'yes' if compensate_alignment_error else 'no'}")
+    lines.append(f"Final output GDS: {output_path}")
+    lines.append(f"Reported layers: {', '.join(str(v) for v in sorted(report_layers))}")
+    lines.append(
+        f"Alignment-error expansion included: "
+        f"{'yes' if compensate_alignment_error else 'no'}"
+    )
+    lines.append(f"Hanging-gridline cleanup included: {'yes' if cleanup_enabled else 'no'}")
+    if cleanup_enabled:
+        lines.append(
+            "Cleanup settings: "
+            f"target layer={cleanup_summary['target_layer']}, "
+            f"reference layer={cleanup_summary['reference_layer']}, "
+            f"span fraction={cleanup_summary['span_fraction']:.3f}"
+        )
+        lines.append(
+            "Cleanup result: "
+            f"removed boundaries={cleanup_summary['removed_boundary_count']}, "
+            f"cells with removals={cleanup_summary['cells_with_removals']}, "
+            f"fallback cells={cleanup_summary['fallback_cell_count']}"
+        )
     lines.append(f"Metadata directory: {metadata_dir}")
     lines.append("")
     lines.append(
-        "Percent removed = area of selected-layer device geometry intersected by "
-        "the final subtraction mask / original selected-layer geometry area."
+        "Percent removed = original reported-layer geometry that is absent from "
+        "the final post-cleanup GDS / original reported-layer geometry."
     )
-    lines.append("Overlapping defect masks are counted once.")
+    lines.append(
+        "This measures the actual final GDS, including defect subtraction and "
+        "hanging-gridline cleanup; newly added shunt area does not hide removals."
+    )
     lines.append("")
 
     if warnings:
         lines.append("WARNINGS")
-        lines.append("-" * 78)
+        lines.append("-" * 92)
         lines.extend(f"- {warning}" for warning in warnings)
         lines.append("")
 
     lines.append("PER-DEVICE RESULTS")
-    lines.append("-" * 78)
+    lines.append("-" * 92)
     if not rows:
-        lines.append("No device metadata was available, so per-device percentages were not calculated.")
+        lines.append(
+            "No device metadata was available, so per-device percentages were not calculated."
+        )
     else:
-        header = f"{'Device':<38} {'Mask polys':>10} {'Original um^2':>15} {'Removed um^2':>14} {'Removed %':>11}"
+        header = (
+            f"{'Device':<34} {'Defect polys':>12} {'Grid rm':>8} "
+            f"{'Original um^2':>15} {'Final orig um^2':>16} "
+            f"{'Removed um^2':>14} {'Removed %':>11}"
+        )
         lines.append(header)
         lines.append("-" * len(header))
         for row in rows:
             pct = f"{row['percent']:.6f}" if np.isfinite(row["percent"]) else "N/A"
             lines.append(
-                f"{row['name'][:38]:<38} {row['defect_polygon_count']:>10d} "
-                f"{row['original']:>15.3f} {row['removed']:>14.3f} {pct:>11}"
+                f"{row['name'][:34]:<34} {row['defect_polygon_count']:>12d} "
+                f"{row['cleanup_removed_boundaries']:>8d} "
+                f"{row['original']:>15.3f} {row['remaining']:>16.3f} "
+                f"{row['removed']:>14.3f} {pct:>11}"
             )
             for layer in sorted(row["layers"]):
                 layer_original = row["layers"][layer]["original"]
+                layer_remaining = row["layers"][layer]["remaining"]
                 layer_removed = row["layers"][layer]["removed"]
-                layer_pct = 100.0 * layer_removed / layer_original if layer_original > 1e-12 else float("nan")
-                layer_pct_text = f"{layer_pct:.6f}%" if np.isfinite(layer_pct) else "N/A"
+                layer_pct = (
+                    100.0 * layer_removed / layer_original
+                    if layer_original > 1e-12
+                    else float("nan")
+                )
+                layer_pct_text = (
+                    f"{layer_pct:.6f}%" if np.isfinite(layer_pct) else "N/A"
+                )
                 lines.append(
                     f"    layer {layer:<4d}: original={layer_original:.3f} um^2, "
-                    f"removed={layer_removed:.3f} um^2, removed={layer_pct_text}"
+                    f"final-original={layer_remaining:.3f} um^2, "
+                    f"removed={layer_removed:.3f} um^2 ({layer_pct_text})"
                 )
 
     lines.append("")
     lines.append("SUMMARY")
-    lines.append("-" * 78)
+    lines.append("-" * 92)
     lines.append(f"Devices with valid denominators: {len(valid_rows)}")
     if valid_rows:
-        lines.append(f"Average device removal percentage (unweighted mean): {mean_percent:.6f}%")
-        lines.append(f"Overall removal percentage (area weighted): {weighted_percent:.6f}%")
-        lines.append(f"Total original selected-layer area: {total_original:.3f} um^2")
-        lines.append(f"Total removed selected-layer area: {total_removed:.3f} um^2")
+        lines.append(
+            f"Average device removal percentage (unweighted mean): {mean_percent:.6f}%"
+        )
+        lines.append(
+            f"Overall removal percentage (area weighted): {weighted_percent:.6f}%"
+        )
+        lines.append(f"Total original reported-layer area: {total_original:.3f} um^2")
+        lines.append(
+            f"Total original area still present in final GDS: {total_remaining:.3f} um^2"
+        )
+        lines.append(f"Total original area removed in final GDS: {total_removed:.3f} um^2")
     else:
         lines.append("Average device removal percentage (unweighted mean): N/A")
         lines.append("Overall removal percentage (area weighted): N/A")
 
-    # H2P_PROGRESS_REPORT_FILE_V2
-    _h2p_report_file_bar = ProgressBar("Removal report: file", 1)
-    _h2p_report_file_bar.status(f"writing {report_path.name}")
+    report_file_bar = ProgressBar("Removal report: file", 1)
+    report_file_bar.status(f"writing {report_path.name}")
     report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    _h2p_report_file_bar.done(extra=f"saved {report_path.name}")
-    print(f"[REPORT] Per-device removal report saved to: {report_path}")
+    report_file_bar.done(extra=f"saved {report_path.name}")
+    print(f"[REPORT] Final-device removal report saved to: {report_path}")
     return report_path
-
 
 def subtract_defects_from_gds(
     gds_path,
@@ -704,6 +964,11 @@ def subtract_defects_from_gds(
     metadata_dir: str | Path = "extracted_cells/metadata",
     report_path: str | Path | None = None,
     write_report: bool = True,
+    cleanup_hanging_gridlines: bool = True,
+    cleanup_target_layer: int = 3,
+    cleanup_reference_layer: int = 7,
+    cleanup_span_fraction: float = 0.60,
+    cleanup_report_path: str | Path | None = None,
 ):
     if not os.path.exists(gds_path):
         raise FileNotFoundError(f"GDS file not found: {gds_path}")
@@ -887,33 +1152,69 @@ def subtract_defects_from_gds(
     )
     output_lib = gdstk.Library(name=lib.name, unit=lib.unit, precision=lib.precision)
     output_lib.add(new_top_cell)
-    # H2P_PROGRESS_GDS_FILE_V2
-    _h2p_gds_file_bar = ProgressBar("Output GDS: file", 1)
-    _h2p_gds_file_bar.status(
-        f"writing {Path(output_path).name}",
-    )
-    output_lib.write_gds(output_path)
-    _h2p_gds_file_bar.done(
-        extra=f"saved {Path(output_path).name}",
-    )
-    print(f"[SUCCESS] Subtraction complete. Saved flat GDS file to: {output_path}")
+    output_path_obj = Path(output_path)
+    output_path_obj.parent.mkdir(parents=True, exist_ok=True)
+    cleanup_summary: dict | None = None
+
+    if cleanup_hanging_gridlines:
+        with tempfile.NamedTemporaryFile(
+            dir=output_path_obj.parent,
+            prefix=f".{output_path_obj.stem}_",
+            suffix="_before_gridline_cleanup.gds",
+            delete=False,
+        ) as temp_stream:
+            intermediate_path = Path(temp_stream.name)
+        try:
+            gds_file_bar = ProgressBar("Output GDS: subtraction file", 1)
+            gds_file_bar.status(f"writing {intermediate_path.name}")
+            output_lib.write_gds(str(intermediate_path))
+            gds_file_bar.done(extra="saved temporary subtraction result")
+
+            cleanup_summary = run_hanging_gridline_cleanup(
+                input_gds=intermediate_path,
+                output_gds=output_path_obj,
+                target_layer=cleanup_target_layer,
+                reference_layer=cleanup_reference_layer,
+                span_fraction=cleanup_span_fraction,
+                report_path=cleanup_report_path,
+                logical_input_path=f"{output_path_obj} (before hanging-gridline cleanup)",
+            )
+        finally:
+            try:
+                intermediate_path.unlink()
+            except FileNotFoundError:
+                pass
+    else:
+        gds_file_bar = ProgressBar("Output GDS: file", 1)
+        gds_file_bar.status(f"writing {output_path_obj.name}")
+        output_lib.write_gds(str(output_path_obj))
+        gds_file_bar.done(extra=f"saved {output_path_obj.name}")
+
+    print(f"[SUCCESS] Final flat GDS saved to: {output_path_obj}")
 
     if write_report:
         if report_path is None:
-            output = Path(output_path)
-            report_path = output.with_name(f"{output.stem}_removal_report.txt")
+            report_path = output_path_obj.with_name(
+                f"{output_path_obj.stem}_removal_report.txt"
+            )
+        final_polys_by_layer_type = _read_flat_polygons_by_layer_type(output_path_obj)
+        report_layers = set(target_layers_set)
+        if cleanup_hanging_gridlines:
+            report_layers.add(int(cleanup_target_layer))
         create_removal_report(
             report_path=report_path,
             metadata_dir=metadata_dir,
             defects_data=defects_data,
             defects_by_device=defects_by_device,
-            polys_by_layer_type=polys_by_layer_type,
-            target_layers=target_layers_set,
+            original_polys_by_layer_type=polys_by_layer_type,
+            final_polys_by_layer_type=final_polys_by_layer_type,
+            report_layers=report_layers,
             precision=precision,
             gds_path=str(gds_path),
             json_path=str(json_path),
-            output_path=str(output_path),
+            output_path=str(output_path_obj),
             compensate_alignment_error=compensate_alignment_error,
+            cleanup_summary=cleanup_summary,
         )
 
 
@@ -984,6 +1285,11 @@ def _run_subtraction_job(
     precision: float,
     no_report: bool,
     no_clean: bool,
+    no_gridline_cleanup: bool,
+    cleanup_target_layer: int,
+    cleanup_reference_layer: int,
+    cleanup_span_fraction: float,
+    cleanup_report_path: str | Path | None,
 ) -> None:
     json_path = Path(json_path)
     output_path = Path(output_path)
@@ -997,6 +1303,11 @@ def _run_subtraction_job(
         if metadata_dir is not None
         else _default_metadata_dir_for_json(json_path)
     )
+    cleanup_report_path = (
+        Path(cleanup_report_path)
+        if cleanup_report_path is not None
+        else output_path.with_name(f"{output_path.stem}_cleanup_report.json")
+    )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if not no_report:
@@ -1005,6 +1316,12 @@ def _run_subtraction_job(
     _clean_existing_output(output_path, label="output GDS", no_clean=no_clean)
     if not no_report:
         _clean_existing_output(report_path, label="report", no_clean=no_clean)
+    if not no_gridline_cleanup:
+        _clean_existing_output(
+            cleanup_report_path,
+            label="cleanup report",
+            no_clean=no_clean,
+        )
 
     subtract_defects_from_gds(
         str(gds_path),
@@ -1022,6 +1339,11 @@ def _run_subtraction_job(
         metadata_dir=metadata_dir,
         report_path=report_path,
         write_report=not no_report,
+        cleanup_hanging_gridlines=not no_gridline_cleanup,
+        cleanup_target_layer=cleanup_target_layer,
+        cleanup_reference_layer=cleanup_reference_layer,
+        cleanup_span_fraction=cleanup_span_fraction,
+        cleanup_report_path=cleanup_report_path,
     )
 
 
@@ -1029,7 +1351,7 @@ def _parse_cli_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Subtract reviewed defect regions from one wafer or every wafer in "
-            "batch_wafers.txt, then write per-device removed-area reports. "
+            "batch_wafers.txt, remove hanging gridlines, then write final per-device removed-area reports. "
             "Batch mode is selected automatically when no defect JSON positional "
             "argument is supplied."
         )
@@ -1183,6 +1505,38 @@ def _parse_cli_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--no-gridline-cleanup",
+        action="store_true",
+        help="Skip the integrated remove_hanging_gridlines.py pass",
+    )
+    parser.add_argument(
+        "--cleanup-target-layer",
+        type=int,
+        default=3,
+        help="Layer cleaned for disconnected grid pieces; default: 3",
+    )
+    parser.add_argument(
+        "--cleanup-reference-layer",
+        type=int,
+        default=7,
+        help="Regular finger-array layer used to infer cells; default: 7",
+    )
+    parser.add_argument(
+        "--cleanup-span-fraction",
+        type=float,
+        default=0.60,
+        help="Required connected-component cell span; default: 0.60",
+    )
+    parser.add_argument(
+        "--cleanup-report",
+        type=str,
+        default=None,
+        help=(
+            "Single-wafer cleanup JSON path. Default: "
+            "<output>_cleanup_report.json"
+        ),
+    )
+    parser.add_argument(
         "--no-report",
         action="store_true",
         help="Do not write per-device removal reports",
@@ -1235,6 +1589,11 @@ def _run_single_mode(args: argparse.Namespace, json_path: str | Path) -> int:
         precision=args.precision,
         no_report=args.no_report,
         no_clean=args.no_clean,
+        no_gridline_cleanup=args.no_gridline_cleanup,
+        cleanup_target_layer=args.cleanup_target_layer,
+        cleanup_reference_layer=args.cleanup_reference_layer,
+        cleanup_span_fraction=args.cleanup_span_fraction,
+        cleanup_report_path=args.cleanup_report,
     )
     return 0
 
@@ -1255,6 +1614,10 @@ def _run_batch_mode(args: argparse.Namespace) -> int:
         raise ValueError("--out cannot represent multiple batch outputs; use --output-dir.")
     if len(selected_records) > 1 and args.report:
         raise ValueError("--report cannot represent multiple batch reports; use default names.")
+    if len(selected_records) > 1 and args.cleanup_report:
+        raise ValueError(
+            "--cleanup-report cannot represent multiple batch reports; use default names."
+        )
     if len(selected_records) > 1 and args.metadata_dir:
         raise ValueError(
             "--metadata-dir cannot represent multiple wafer metadata folders. "
@@ -1292,6 +1655,11 @@ def _run_batch_mode(args: argparse.Namespace) -> int:
             if args.metadata_dir
             else _default_metadata_dir_for_json(json_path)
         )
+        cleanup_report_path = (
+            Path(args.cleanup_report)
+            if args.cleanup_report
+            else output_path.with_name(f"{output_path.stem}_cleanup_report.json")
+        )
 
         print("\n" + "=" * 72)
         print(f" MASK RUN [{index}/{total}]: {wafer_id}")
@@ -1326,6 +1694,11 @@ def _run_batch_mode(args: argparse.Namespace) -> int:
                 precision=args.precision,
                 no_report=args.no_report,
                 no_clean=args.no_clean,
+                no_gridline_cleanup=args.no_gridline_cleanup,
+                cleanup_target_layer=args.cleanup_target_layer,
+                cleanup_reference_layer=args.cleanup_reference_layer,
+                cleanup_span_fraction=args.cleanup_span_fraction,
+                cleanup_report_path=cleanup_report_path,
             )
         except KeyboardInterrupt:
             print(f"\n[{wafer_id}] Interrupted by user.", flush=True)
