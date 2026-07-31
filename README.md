@@ -140,7 +140,7 @@ Install the Python dependencies:
 
 ```powershell
 python -m pip install --upgrade pip
-python -m pip install numpy opencv-python pillow gdstk
+python -m pip install numpy opencv-python pillow gdstk shapely
 ```
 
 `tkinter` is used by the alignment, review, and device-viewer interfaces and is normally included with the standard Windows Python installer.
@@ -172,17 +172,18 @@ The main files are:
 19. device_index_defect_viewer.py           Cross-wafer device-index inspection UI
 
 20. subtract_defects.py                     Stage 3 GDS subtraction
-21. batch_wafers_parser.py                  Compact and legacy batch-file parser
-22. wafer_run_layout.py                     Per-wafer output path helpers
-23. h2p_progress.py                         Shared command-line progress reporting
-24. migrate_combined_extracted_cells.py     Migrates older combined extraction output
+21. remove_hanging_gridlines.py             Removes floating grid line parts
+22. batch_wafers_parser.py                  Compact and legacy batch-file parser
+23. wafer_run_layout.py                     Per-wafer output path helpers
+24. h2p_progress.py                         Shared command-line progress reporting
+25. migrate_combined_extracted_cells.py     Migrates older combined extraction output
 
-25. config.json                             Geometry and stitching configuration
-26. batch_wafers.txt                        Compact wafer-name list
-27. future_design.gds                       Active future-design GDS
-28. semiconductor_design.gds                Legacy GDS used by the old workflow
+26. config.json                             Geometry and stitching configuration
+27. batch_wafers.txt                        Compact wafer-name list
+28. future_design.gds                       Active future-design GDS
+29. semiconductor_design.gds                Legacy GDS used by the old workflow
 
-29. assets\h2pLogo.png                      H2P logo used by the device viewer
+30. assets\h2pLogo.png                      H2P logo used by the device viewer
 ```
 
 ## Configuration
