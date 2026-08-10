@@ -1,4 +1,8 @@
-Wafer_A:
-"folder_of_tiles"
-"none"
-"none"
+name: mesaetch
+path: C:\Users\reala\Documents\code\h2p_device_view_temp\wafer_n_mesaetch
+
+name: substrateetch
+path: C:\Users\reala\Documents\code\h2p_device_view_temp\wafer_n_substrateetch
+
+folder_name: LORs
+path: C:\Users\reala\Documents\code\h2p_device_view_temp\LOR
