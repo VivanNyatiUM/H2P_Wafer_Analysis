@@ -9,6 +9,7 @@ from typing import Iterable
 
 VERSION = "per-wafer-batch-output-v20-2026-07-23"
 
+GROUPED_WAFER_IDS_EXACT_V1 = True
 _CELL_NAME = re.compile(
     r"^(?P<wafer>.+)_cell_(?P<row>\d+)-(?P<col>\d+)"
     r"(?:[_.-].*)?$",
@@ -24,22 +25,26 @@ def normalize_wafer_id(value: str) -> str:
 
 
 def wafer_run_root(base_output_dir: str | Path, wafer_id: str) -> Path:
-    return Path(base_output_dir) / normalize_wafer_id(wafer_id)
-
+    wafer_id = str(wafer_id).strip()
+    if not wafer_id:
+        raise ValueError("Wafer id cannot be empty.")
+    return Path(base_output_dir) / wafer_id
 
 def infer_wafer_id_from_cell_name(filename: str | Path) -> str | None:
     stem = Path(filename).stem
     match = _CELL_NAME.match(stem)
     if not match:
         return None
-    return normalize_wafer_id(match.group("wafer"))
-
+    wafer_id = match.group("wafer").strip()
+    return wafer_id or None
 
 def detector_paths(
     base_output_dir: str | Path,
     wafer_id: str,
 ) -> dict[str, Path]:
-    wafer_id = normalize_wafer_id(wafer_id)
+    wafer_id = str(wafer_id).strip()
+    if not wafer_id:
+        raise ValueError("Wafer id cannot be empty.")
     root = wafer_run_root(base_output_dir, wafer_id)
     return {
         "root": root,
@@ -52,7 +57,6 @@ def detector_paths(
         "gds_json": root / f"{wafer_id}_device_defects.json",
         "review_state": root / f"{wafer_id}_device_defects.json.review_state.json",
     }
-
 
 def existing_wafer_runs(base_output_dir: str | Path) -> list[Path]:
     base = Path(base_output_dir)
@@ -82,16 +86,34 @@ def select_wafer_ids(
     records: Iterable[dict],
     requested: Iterable[str] | None = None,
 ) -> list[str]:
-    all_ids = [normalize_wafer_id(str(record["id"])) for record in records]
-    if not requested:
+    all_ids = []
+    for record in records:
+        wafer_id = str(record["id"]).strip()
+        if not wafer_id:
+            raise ValueError("Wafer id cannot be empty.")
+        all_ids.append(wafer_id)
+
+    requested_values = [str(value).strip() for value in (requested or []) if str(value).strip()]
+    if not requested_values:
         return all_ids
 
-    requested_ids = {normalize_wafer_id(value).casefold() for value in requested}
-    selected = [wafer_id for wafer_id in all_ids if wafer_id.casefold() in requested_ids]
-    missing = sorted(requested_ids - {value.casefold() for value in selected})
+    selected: list[str] = []
+    missing: list[str] = []
+    for request in requested_values:
+        aliases = {request.casefold(), normalize_wafer_id(request).casefold()}
+        match = next(
+            (wafer_id for wafer_id in all_ids if wafer_id.casefold() in aliases),
+            None,
+        )
+        if match is None:
+            missing.append(request)
+        elif match not in selected:
+            selected.append(match)
+
     if missing:
         raise ValueError(
             "Requested wafer(s) are not present in the batch file: "
             + ", ".join(missing)
         )
     return selected
+
