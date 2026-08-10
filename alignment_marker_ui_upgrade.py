@@ -13,13 +13,14 @@ _install_h2p_ui_branding()
 
 import copy
 import math
+import os
 import time
 from typing import Any, Iterable
 
 import cv2
 import numpy as np
 
-UPGRADE_VERSION = "alignment-marker-review-v1-staged-drag-snap-2026-07-24"
+UPGRADE_VERSION = "alignment-marker-review-v2-switchable-nudge-svd-snap-2026-08-10"
 
 
 def _real_box_items(boxes: dict[Any, Any]) -> list[tuple[Any, list[tuple[float, float]]]]:
@@ -108,6 +109,248 @@ def _edge_proximity_image(image_bgr: np.ndarray) -> np.ndarray:
     return proximity
 
 
+def _score_template_pose(
+    proximity: np.ndarray,
+    items: list[tuple[Any, list[tuple[float, float]]]],
+    marker: tuple[float, float],
+    scale: float,
+    angle_deg: float,
+    translation: tuple[float, float],
+    common_origin: tuple[int, int],
+    line_thickness: int,
+) -> float:
+    """Score one fully specified similarity pose against the edge image."""
+    transformed_sets = [
+        _transform_points(corners, marker, scale, angle_deg, translation)
+        for _key, corners in items
+    ]
+    transformed_points = [point for corners in transformed_sets for point in corners]
+    if not transformed_points:
+        return 0.0
+
+    min_x = math.floor(min(point[0] for point in transformed_points)) - 4
+    min_y = math.floor(min(point[1] for point in transformed_points)) - 4
+    max_x = math.ceil(max(point[0] for point in transformed_points)) + 4
+    max_y = math.ceil(max(point[1] for point in transformed_points)) + 4
+    template_w = int(max_x - min_x + 1)
+    template_h = int(max_y - min_y + 1)
+    if template_w < 5 or template_h < 5:
+        return 0.0
+
+    template = np.zeros((template_h, template_w), dtype=np.float32)
+    for corners in transformed_sets:
+        local = np.asarray(
+            [[int(round(x - min_x)), int(round(y - min_y))] for x, y in corners],
+            dtype=np.int32,
+        ).reshape((-1, 1, 2))
+        cv2.polylines(template, [local], True, 1.0, line_thickness, cv2.LINE_AA)
+    template = np.clip(template, 0.0, 1.0)
+    template_mass = float(np.sum(template))
+    if template_mass < 8.0:
+        return 0.0
+
+    common_x0, common_y0 = common_origin
+    px0 = int(min_x - common_x0)
+    py0 = int(min_y - common_y0)
+    px1 = px0 + template_w
+    py1 = py0 + template_h
+    if px0 < 0 or py0 < 0 or px1 > proximity.shape[1] or py1 > proximity.shape[0]:
+        return 0.0
+    patch = proximity[py0:py1, px0:px1]
+    if patch.shape != template.shape:
+        return 0.0
+    return float(np.sum(patch * template) / template_mass)
+
+
+def _svd_similarity_fit(
+    source: np.ndarray,
+    target: np.ndarray,
+) -> tuple[float, float, np.ndarray, np.ndarray] | None:
+    """Least-squares 2-D similarity fit using an SVD/Procrustes solve."""
+    source = np.asarray(source, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    if source.ndim != 2 or target.shape != source.shape or source.shape[0] < 3 or source.shape[1] != 2:
+        return None
+
+    src_mean = np.mean(source, axis=0)
+    dst_mean = np.mean(target, axis=0)
+    src_centered = source - src_mean
+    dst_centered = target - dst_mean
+    denominator = float(np.sum(src_centered * src_centered))
+    if denominator < 1e-9:
+        return None
+
+    covariance = src_centered.T @ dst_centered
+    u, _singular, vt = np.linalg.svd(covariance)
+    rotation = vt.T @ u.T
+    if np.linalg.det(rotation) < 0:
+        vt[-1, :] *= -1.0
+        rotation = vt.T @ u.T
+
+    rotated = src_centered @ rotation.T
+    scale = float(np.sum(rotated * dst_centered) / max(np.sum(rotated * rotated), 1e-9))
+    if not math.isfinite(scale) or scale <= 0.0:
+        return None
+    translation = dst_mean - scale * (rotation @ src_mean)
+    angle_deg = math.degrees(math.atan2(float(rotation[1, 0]), float(rotation[0, 0])))
+    fitted = scale * (source @ rotation.T) + translation
+    residuals = np.linalg.norm(fitted - target, axis=1)
+    return scale, angle_deg, translation, residuals
+
+
+def _refine_snap_with_vertices(
+    image_bgr: np.ndarray,
+    items: list[tuple[Any, list[tuple[float, float]]]],
+    marker: tuple[float, float],
+    best: dict[str, Any],
+    proximity: np.ndarray,
+    common_bounds: tuple[int, int, int, int],
+    square_side: float,
+    pitch: float,
+    search_radius: int,
+    line_thickness: int,
+) -> dict[str, Any] | None:
+    """Use nearby optical vertices to refine rotation/scale with an SVD fit."""
+    common_x0, common_y0, common_x1, common_y1 = common_bounds
+    crop = image_bgr[common_y0:common_y1, common_x0:common_x1]
+    if crop.size == 0:
+        return None
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop.astype(np.uint8, copy=False)
+    gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+
+    all_source = np.asarray([point for _key, corners in items for point in corners], dtype=np.float64)
+    if all_source.shape[0] < 6:
+        return None
+    max_corners = int(np.clip(all_source.shape[0] * 10, 120, 1200))
+    min_distance = max(3.0, 0.08 * max(square_side, 1.0))
+    corners = cv2.goodFeaturesToTrack(
+        gray,
+        maxCorners=max_corners,
+        qualityLevel=0.008,
+        minDistance=min_distance,
+        blockSize=5,
+        useHarrisDetector=False,
+    )
+    if corners is None or len(corners) < 6:
+        return None
+    optical = corners.reshape((-1, 2)).astype(np.float64)
+    optical[:, 0] += common_x0
+    optical[:, 1] += common_y0
+
+    predicted = np.asarray(
+        _transform_points(
+            all_source,
+            marker,
+            float(best["scale"]),
+            float(best["angle_deg"]),
+            (float(best["dx"]), float(best["dy"])),
+        ),
+        dtype=np.float64,
+    )
+    vertex_radius = float(np.clip(round(0.32 * max(square_side, 1.0)), 7, max(18, round(0.24 * pitch))))
+    used: set[int] = set()
+    src_matches: list[np.ndarray] = []
+    dst_matches: list[np.ndarray] = []
+
+    # Prefer well-spread vertices so the SVD angle is not dominated by one tiny cluster.
+    order = np.argsort(-np.linalg.norm(predicted - np.asarray(marker, dtype=np.float64), axis=1))
+    for index in order:
+        distances = np.linalg.norm(optical - predicted[index], axis=1)
+        for candidate_index in np.argsort(distances)[:8]:
+            ci = int(candidate_index)
+            if ci in used or float(distances[ci]) > vertex_radius:
+                continue
+            used.add(ci)
+            src_matches.append(all_source[index])
+            dst_matches.append(optical[ci])
+            break
+
+    if len(src_matches) < 6:
+        return None
+    src = np.asarray(src_matches, dtype=np.float64)
+    dst = np.asarray(dst_matches, dtype=np.float64)
+    fit = _svd_similarity_fit(src, dst)
+    if fit is None:
+        return None
+
+    scale, angle_deg, world_translation, residuals = fit
+    median = float(np.median(residuals))
+    mad = float(np.median(np.abs(residuals - median)))
+    residual_limit = min(vertex_radius, max(3.0, median + 2.8 * max(mad, 1.0)))
+    inliers = residuals <= residual_limit
+    if int(np.count_nonzero(inliers)) >= 6 and int(np.count_nonzero(inliers)) < len(src):
+        refit = _svd_similarity_fit(src[inliers], dst[inliers])
+        if refit is not None:
+            scale, angle_deg, world_translation, residuals = refit
+            src = src[inliers]
+            dst = dst[inliers]
+
+    if not (0.86 <= scale <= 1.14) or abs(angle_deg) > 12.0:
+        return None
+
+    theta = math.radians(angle_deg)
+    rotation = np.asarray(
+        [[math.cos(theta), -math.sin(theta)], [math.sin(theta), math.cos(theta)]],
+        dtype=np.float64,
+    )
+    marker_vec = np.asarray(marker, dtype=np.float64)
+    centered_translation = world_translation - marker_vec + scale * (rotation @ marker_vec)
+    dx, dy = float(centered_translation[0]), float(centered_translation[1])
+    if math.hypot(dx, dy) > max(1.35 * float(search_radius), 1.10 * pitch):
+        return None
+
+    # Let the SVD determine the angle/marker translation, then re-check a tiny
+    # scale neighborhood with the optical edge score. Corner localization can
+    # bias the raw SVD scale by a pixel or two even when its angle is excellent.
+    coarse_scale = float(best["scale"])
+    scale_trials = {float(scale), coarse_scale}
+    for offset in np.arange(-0.03, 0.0301, 0.01):
+        trial = coarse_scale + float(offset)
+        if 0.86 <= trial <= 1.14:
+            scale_trials.add(round(trial, 5))
+    edge_score = -1.0
+    chosen_scale = float(scale)
+    for trial_scale in sorted(scale_trials):
+        trial_score = _score_template_pose(
+            proximity,
+            items,
+            marker,
+            float(trial_scale),
+            angle_deg,
+            (dx, dy),
+            (common_x0, common_y0),
+            line_thickness,
+        )
+        if trial_score > edge_score:
+            edge_score = trial_score
+            chosen_scale = float(trial_scale)
+    scale = chosen_scale
+    if edge_score <= 0.0:
+        return None
+
+    fitted = scale * (src @ rotation.T) + (np.asarray(marker, dtype=np.float64) + np.asarray((dx, dy), dtype=np.float64) - scale * (rotation @ np.asarray(marker, dtype=np.float64)))
+    rms = float(np.sqrt(np.mean(np.sum((fitted - dst) ** 2, axis=1)))) if len(src) else float("inf")
+    displacement = math.hypot(dx, dy)
+    spatial_penalty = 0.13 * (displacement / max(float(search_radius), 1.0)) ** 2
+    transform_penalty = 0.008 * (abs(angle_deg) / 8.0) ** 2 + 0.008 * (abs(scale - 1.0) / 0.08) ** 2
+    vertex_quality = max(0.0, 1.0 - rms / max(vertex_radius, 1.0))
+    vertex_bonus = 0.045 * min(1.0, len(src) / 12.0) * vertex_quality
+    selection_score = edge_score - spatial_penalty - transform_penalty + vertex_bonus
+    return {
+        "score": edge_score,
+        "selection_score": selection_score,
+        "dx": dx,
+        "dy": dy,
+        "scale": scale,
+        "angle_deg": angle_deg,
+        "pitch": pitch,
+        "search_radius": search_radius,
+        "svd_refined": True,
+        "svd_vertices": int(len(src)),
+        "svd_rms": rms,
+    }
+
+
 def find_local_template_snap(
     image_bgr: np.ndarray,
     boxes: dict[Any, Any],
@@ -117,11 +360,12 @@ def find_local_template_snap(
     angle_candidates: Iterable[float] | None = None,
     scale_candidates: Iterable[float] | None = None,
 ) -> dict[str, Any]:
-    """Fit a GDS-derived square template to nearby optical edges.
+    """Fit a GDS-derived square template to nearby optical edges and vertices.
 
-    Coordinates in ``boxes``, ``squares`` and ``marker`` are in the coordinate
-    system of ``image_bgr``. The search is deliberately local; the absolute
-    placement must already be approximately correct.
+    The coarse pass searches a wider nearby area than v1. A second pass refines
+    the best angle/scale neighborhood, then a bounded SVD/Procrustes solve uses
+    nearby optical corners to improve the rotation and scale when the vertices
+    support it.
     """
     items = _real_box_items(boxes)
     if len(items) < 4:
@@ -139,23 +383,26 @@ def find_local_template_snap(
             for _key, corners in items
         ]
     pitch = max(8.0, _nearest_neighbor_pitch(center_points))
-    search_radius = int(np.clip(round(0.55 * pitch), 24, 420))
+    search_radius = int(np.clip(round(0.90 * pitch), 32, 640))
 
+    supplied_angles = angle_candidates is not None
+    supplied_scales = scale_candidates is not None
     if angle_candidates is None:
-        angle_candidates = (-3.0, -2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 3.0)
+        angle_candidates = (-8.0, -4.0, -2.0, 0.0, 2.0, 4.0, 8.0)
     if scale_candidates is None:
-        scale_candidates = (0.94, 0.97, 1.0, 1.03, 1.06)
+        scale_candidates = (0.94, 1.0, 1.06)
     angles = [float(value) for value in angle_candidates]
     scales = [float(value) for value in scale_candidates]
 
     all_points = [point for _key, corners in items for point in corners]
     relative = np.asarray([[x - marker[0], y - marker[1]] for x, y in all_points], dtype=np.float64)
-    max_radius_x = max(20.0, float(np.max(np.abs(relative[:, 0]))) * max(scales) + 10.0)
-    max_radius_y = max(20.0, float(np.max(np.abs(relative[:, 1]))) * max(scales) + 10.0)
-    common_x0 = max(0, int(math.floor(marker[0] - max_radius_x - search_radius - 8)))
-    common_y0 = max(0, int(math.floor(marker[1] - max_radius_y - search_radius - 8)))
-    common_x1 = min(image_bgr.shape[1], int(math.ceil(marker[0] + max_radius_x + search_radius + 8)))
-    common_y1 = min(image_bgr.shape[0], int(math.ceil(marker[1] + max_radius_y + search_radius + 8)))
+    max_scale_for_crop = max([1.14] + [abs(value) for value in scales])
+    max_radius_x = max(20.0, float(np.max(np.abs(relative[:, 0]))) * max_scale_for_crop + 12.0)
+    max_radius_y = max(20.0, float(np.max(np.abs(relative[:, 1]))) * max_scale_for_crop + 12.0)
+    common_x0 = max(0, int(math.floor(marker[0] - max_radius_x - search_radius - 12)))
+    common_y0 = max(0, int(math.floor(marker[1] - max_radius_y - search_radius - 12)))
+    common_x1 = min(image_bgr.shape[1], int(math.ceil(marker[0] + max_radius_x + search_radius + 12)))
+    common_y1 = min(image_bgr.shape[0], int(math.ceil(marker[1] + max_radius_y + search_radius + 12)))
     if common_x1 - common_x0 < 20 or common_y1 - common_y0 < 20:
         return {"ok": False, "reason": "snap search region falls outside image"}
 
@@ -163,114 +410,182 @@ def find_local_template_snap(
     if proximity.size == 0:
         return {"ok": False, "reason": "empty snap search image"}
 
-    # Approximate physical square size controls line thickness without tying the
-    # fitter to a particular acquisition resolution.
     side_lengths: list[float] = []
     for _key, corners in items:
         for p0, p1 in zip(corners, corners[1:] + corners[:1]):
             side_lengths.append(math.hypot(p1[0] - p0[0], p1[1] - p0[1]))
     square_side = float(np.median(side_lengths)) if side_lengths else 0.5 * pitch
     line_thickness = int(np.clip(round(0.035 * square_side), 1, 4))
-
+    baseline_score = _score_template_pose(
+        proximity, items, marker, 1.0, 0.0, (0.0, 0.0), (common_x0, common_y0), line_thickness
+    )
     best: dict[str, Any] | None = None
-    baseline_score = 0.0
+    raw_best: dict[str, Any] | None = None
 
-    for scale in scales:
-        for angle_deg in angles:
-            transformed_sets = [
-                _transform_points(corners, marker, scale, angle_deg)
-                for _key, corners in items
-            ]
-            transformed_points = [point for corners in transformed_sets for point in corners]
-            min_x = math.floor(min(point[0] for point in transformed_points)) - 4
-            min_y = math.floor(min(point[1] for point in transformed_points)) - 4
-            max_x = math.ceil(max(point[0] for point in transformed_points)) + 4
-            max_y = math.ceil(max(point[1] for point in transformed_points)) + 4
-            template_w = int(max_x - min_x + 1)
-            template_h = int(max_y - min_y + 1)
-            if template_w < 5 or template_h < 5:
+    def evaluate(candidate_angles: Iterable[float], candidate_scales: Iterable[float]) -> None:
+        nonlocal best, raw_best
+        seen: set[tuple[float, float]] = set()
+        for scale in candidate_scales:
+            scale = float(scale)
+            if not (0.84 <= scale <= 1.16):
                 continue
+            for angle_deg in candidate_angles:
+                angle_deg = float(angle_deg)
+                signature = (round(scale, 5), round(angle_deg, 5))
+                if signature in seen:
+                    continue
+                seen.add(signature)
+                transformed_sets = [
+                    _transform_points(corners, marker, scale, angle_deg)
+                    for _key, corners in items
+                ]
+                transformed_points = [point for corners in transformed_sets for point in corners]
+                min_x = math.floor(min(point[0] for point in transformed_points)) - 4
+                min_y = math.floor(min(point[1] for point in transformed_points)) - 4
+                max_x = math.ceil(max(point[0] for point in transformed_points)) + 4
+                max_y = math.ceil(max(point[1] for point in transformed_points)) + 4
+                template_w = int(max_x - min_x + 1)
+                template_h = int(max_y - min_y + 1)
+                if template_w < 5 or template_h < 5:
+                    continue
 
-            template = np.zeros((template_h, template_w), dtype=np.float32)
-            for corners in transformed_sets:
-                local = np.asarray(
-                    [[int(round(x - min_x)), int(round(y - min_y))] for x, y in corners],
-                    dtype=np.int32,
-                ).reshape((-1, 1, 2))
-                cv2.polylines(template, [local], True, 1.0, line_thickness, cv2.LINE_AA)
-            template = np.clip(template, 0.0, 1.0)
-            template_mass = float(np.sum(template))
-            if template_mass < 8.0:
-                continue
+                template = np.zeros((template_h, template_w), dtype=np.float32)
+                for corners in transformed_sets:
+                    local = np.asarray(
+                        [[int(round(x - min_x)), int(round(y - min_y))] for x, y in corners],
+                        dtype=np.int32,
+                    ).reshape((-1, 1, 2))
+                    cv2.polylines(template, [local], True, 1.0, line_thickness, cv2.LINE_AA)
+                template = np.clip(template, 0.0, 1.0)
+                template_mass = float(np.sum(template))
+                if template_mass < 8.0:
+                    continue
 
-            expected_x = int(round(min_x - common_x0))
-            expected_y = int(round(min_y - common_y0))
-            search_x0 = max(0, expected_x - search_radius)
-            search_y0 = max(0, expected_y - search_radius)
-            search_x1 = min(proximity.shape[1], expected_x + search_radius + template_w)
-            search_y1 = min(proximity.shape[0], expected_y + search_radius + template_h)
-            search = proximity[search_y0:search_y1, search_x0:search_x1]
-            if search.shape[0] < template_h or search.shape[1] < template_w:
-                continue
+                expected_x = int(round(min_x - common_x0))
+                expected_y = int(round(min_y - common_y0))
+                search_x0 = max(0, expected_x - search_radius)
+                search_y0 = max(0, expected_y - search_radius)
+                search_x1 = min(proximity.shape[1], expected_x + search_radius + template_w)
+                search_y1 = min(proximity.shape[0], expected_y + search_radius + template_h)
+                search = proximity[search_y0:search_y1, search_x0:search_x1]
+                if search.shape[0] < template_h or search.shape[1] < template_w:
+                    continue
 
-            response = cv2.matchTemplate(search, template, cv2.TM_CCORR)
-            _min_value, max_value, _min_location, max_location = cv2.minMaxLoc(response)
-            score = float(max_value / template_mass)
-            placed_x = search_x0 + int(max_location[0])
-            placed_y = search_y0 + int(max_location[1])
-            dx = float(placed_x - expected_x)
-            dy = float(placed_y - expected_y)
+                response = cv2.matchTemplate(search, template, cv2.TM_CCORR)
+                _min_value, max_value, _min_location, max_location = cv2.minMaxLoc(response)
+                score = float(max_value / template_mass)
+                placed_x = search_x0 + int(max_location[0])
+                placed_y = search_y0 + int(max_location[1])
+                dx = float(placed_x - expected_x)
+                dy = float(placed_y - expected_y)
+                displacement = math.hypot(dx, dy)
+                spatial_penalty = 0.13 * (displacement / max(float(search_radius), 1.0)) ** 2
+                transform_penalty = 0.008 * (abs(angle_deg) / 8.0) ** 2 + 0.008 * (abs(scale - 1.0) / 0.08) ** 2
+                selection_score = score - spatial_penalty - transform_penalty
+                candidate = {
+                    "score": score,
+                    "selection_score": selection_score,
+                    "dx": dx,
+                    "dy": dy,
+                    "scale": scale,
+                    "angle_deg": angle_deg,
+                    "pitch": pitch,
+                    "search_radius": search_radius,
+                    "svd_refined": False,
+                }
+                if best is None or selection_score > float(best["selection_score"]):
+                    best = candidate
+                if raw_best is None or score > float(raw_best["score"]):
+                    raw_best = candidate
 
-            if abs(scale - 1.0) < 1e-9 and abs(angle_deg) < 1e-9:
-                bx = int(np.clip(expected_x, search_x0, search_x1 - template_w))
-                by = int(np.clip(expected_y, search_y0, search_y1 - template_h))
-                patch = proximity[by : by + template_h, bx : bx + template_w]
-                if patch.shape == template.shape:
-                    baseline_score = float(np.sum(patch * template) / template_mass)
-
-            displacement = math.hypot(dx, dy)
-            spatial_penalty = 0.22 * (displacement / max(float(search_radius), 1.0)) ** 2
-            transform_penalty = 0.012 * (abs(angle_deg) / 3.0) ** 2 + 0.010 * (abs(scale - 1.0) / 0.06) ** 2
-            selection_score = score - spatial_penalty - transform_penalty
-            candidate = {
-                "score": score,
-                "selection_score": selection_score,
-                "dx": dx,
-                "dy": dy,
-                "scale": scale,
-                "angle_deg": angle_deg,
-                "pitch": pitch,
-                "search_radius": search_radius,
-                "baseline_score": baseline_score,
-            }
-            if best is None or selection_score > float(best["selection_score"]):
-                best = candidate
-
+    evaluate(angles, scales)
     if best is None:
         return {"ok": False, "reason": "no valid snap candidates"}
+    if raw_best is not None and float(raw_best["score"]) >= float(best["score"]) + 0.035:
+        best = raw_best
+
+    # Dense local second pass around the best coarse pose.
+    if not supplied_angles:
+        center_angle = float(best["angle_deg"])
+        fine_angles = np.arange(center_angle - 2.0, center_angle + 2.001, 0.5)
+    else:
+        fine_angles = angles
+    if not supplied_scales:
+        center_scale = float(best["scale"])
+        fine_scales = np.arange(center_scale - 0.04, center_scale + 0.0401, 0.02)
+    else:
+        fine_scales = scales
+    evaluate(fine_angles, fine_scales)
+    if raw_best is not None and float(raw_best["score"]) >= float(best["score"]) + 0.035:
+        best = raw_best
+
+    refined = _refine_snap_with_vertices(
+        image_bgr,
+        items,
+        marker,
+        best,
+        proximity,
+        (common_x0, common_y0, common_x1, common_y1),
+        square_side,
+        pitch,
+        search_radius,
+        line_thickness,
+    )
+    if refined is not None:
+        # SVD is allowed to trade a tiny amount of edge score for much better
+        # vertex agreement, but never for a clearly worse optical match.
+        if (
+            float(refined["score"]) >= float(best["score"]) - 0.025
+            and float(refined["selection_score"]) >= float(best["selection_score"]) - 0.004
+        ):
+            best = refined
 
     best["baseline_score"] = baseline_score
     improvement = float(best["score"] - baseline_score)
     best["improvement"] = improvement
     displacement = math.hypot(float(best["dx"]), float(best["dy"]))
     transform_size = abs(math.log(max(float(best["scale"]), 1e-9))) + abs(math.radians(float(best["angle_deg"])))
-
-    # Edge coverage around 0.30 is already useful on faint bright-field scans.
-    # A nearly motionless high-confidence result is reported as success so the
-    # button can confirm an already-good manual placement rather than pretending
-    # nothing happened.
     reliable = float(best["score"]) >= 0.30 and (
-        improvement >= 0.018
-        or float(best["score"]) >= 0.48
-        or (displacement <= max(2.0, 0.04 * pitch) and transform_size <= 0.015)
+        improvement >= 0.015
+        or float(best["score"]) >= 0.47
+        or (displacement <= max(2.0, 0.04 * pitch) and transform_size <= 0.018)
+        or (bool(best.get("svd_refined")) and float(best.get("svd_rms", 999.0)) <= max(3.0, 0.12 * square_side))
     )
     best["ok"] = bool(reliable)
     if not reliable:
-        best["reason"] = (
-            f"weak edge match (score {best['score']:.2f}, improvement {improvement:+.2f})"
-        )
+        best["reason"] = f"weak edge/vertex match (score {best['score']:.2f}, improvement {improvement:+.2f})"
     return best
 
+
+def _decode_arrow_key(key: int) -> tuple[int, int] | None:
+    """Return a unit nudge vector for common waitKeyEx arrow codes."""
+    mapping = {
+        0x250000: (-1, 0),  # Win32 VK_LEFT << 16
+        0x260000: (0, -1),  # Win32 VK_UP << 16
+        0x270000: (1, 0),   # Win32 VK_RIGHT << 16
+        0x280000: (0, 1),   # Win32 VK_DOWN << 16
+        65361: (-1, 0),     # X11/Qt Left
+        65362: (0, -1),
+        65363: (1, 0),
+        65364: (0, 1),
+        63234: (-1, 0),     # Cocoa legacy key codes
+        63232: (0, -1),
+        63235: (1, 0),
+        63233: (0, 1),
+    }
+    return mapping.get(int(key))
+
+
+def _shift_key_down() -> bool:
+    """Check Shift while an arrow is handled; Win32 waitKeyEx omits modifiers."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.user32.GetAsyncKeyState(0x10) & 0x8000)
+    except Exception:
+        return False
 
 def _inside(box: tuple[int, int, int, int], x: int, y: int) -> bool:
     x1, y1, x2, y2 = box
@@ -299,6 +614,7 @@ def install_alignment_marker_ui_upgrade(pipeline: Any) -> None:
             self.recompute_display_sizes()
 
             self._workflow_stage = "auto"
+            self._manual_active_side = "left"
             self._manual_button_flash_until = 0.0
             self._main_drag_side: str | None = None
             self._snap_button_bounds: dict[str, tuple[int, int, int, int]] = {}
@@ -309,15 +625,15 @@ def install_alignment_marker_ui_upgrade(pipeline: Any) -> None:
             self.redraw_gui()
 
         def _layout_upgrade_buttons(self) -> None:
-            labels = ("MANUAL ALIGN", "DONE LEFT", "DONE RIGHT", "RESET", "ACCEPT / EXIT")
-            left_margin, right_margin, gap = 12, 12, 8
+            labels = ("MANUAL ALIGN", "LEFT", "RIGHT", "DONE", "RESET", "ACCEPT / EXIT")
+            left_margin, right_margin, gap = 12, 12, 7
             total_gap = gap * (len(labels) - 1)
-            width = max(90, (self.canvas_w - left_margin - right_margin - total_gap) // len(labels))
+            width = max(78, (self.canvas_w - left_margin - right_margin - total_gap) // len(labels))
             y1 = self.top_bar_h + self.target_height + 34
             y2 = min(self.canvas_h - 23, y1 + 48)
             self._upgrade_buttons: dict[str, dict[str, Any]] = {}
             x = left_margin
-            keys = ("manual", "done_left", "done_right", "reset", "accept")
+            keys = ("manual", "left", "right", "done", "reset", "accept")
             for key, label in zip(keys, labels):
                 x2 = self.canvas_w - right_margin if key == "accept" else x + width
                 self._upgrade_buttons[key] = {"label": label, "box": (int(x), int(y1), int(x2), int(y2))}
@@ -332,12 +648,12 @@ def install_alignment_marker_ui_upgrade(pipeline: Any) -> None:
 
         def _stage_instruction(self) -> str:
             if self._workflow_stage == "absolute_left":
-                return "LEFT: click or drag on the wafer, then fine-tune the left panel and press DONE LEFT"
+                return "LEFT selected: click/drag wafer or use arrows (Shift+arrows = 10 px); switch RIGHT anytime; DONE when ready"
             if self._workflow_stage == "absolute_right":
-                return "RIGHT: click or drag on the wafer, then fine-tune the right panel and press DONE RIGHT"
+                return "RIGHT selected: click/drag wafer or use arrows (Shift+arrows = 10 px); switch LEFT anytime; DONE when ready"
             if self._workflow_stage == "relative":
-                return "RELATIVE: move/scale/rotate either panel or use ATTEMPT SNAP, then ACCEPT / EXIT"
-            return "Automatic marker boxes are active. MANUAL ALIGN starts the staged override workflow"
+                return "DONE: relative move/scale/rotate and ATTEMPT SNAP are enabled; press DONE again to resume LEFT/RIGHT absolute editing"
+            return "Automatic marker boxes are active. MANUAL ALIGN starts the override workflow"
 
         def _set_stage_status(self, action: str | None = None) -> None:
             instruction = self._stage_instruction()
@@ -352,48 +668,94 @@ def install_alignment_marker_ui_upgrade(pipeline: Any) -> None:
             else:
                 self.status_bg_color = (78, 48, 0)
 
-        def _start_manual_workflow(self) -> None:
-            self._manual_button_flash_until = time.monotonic() + 0.38
-            self._workflow_stage = "absolute_left"
+        def _set_manual_side(self, side: str, *, announce: bool = True) -> None:
+            if side not in ("left", "right"):
+                return
+            self._manual_active_side = side
+            self._workflow_stage = f"absolute_{side}"
+            self.current_state = self.STATE_WAIT_LEFT if side == "left" else self.STATE_WAIT_RIGHT
             self._manual_edit_enabled = True
-            self.current_state = self.STATE_WAIT_LEFT
             self._main_drag_side = None
             self._panel_drag_side = None
             self._panel_drag_mode = None
-            self._snap_status = {"left": "Locked until both absolute sides are done", "right": "Locked until both absolute sides are done"}
-            left = getattr(self, "left_marker_global", None)
-            if left is not None:
-                self._set_panel_view_center("left", tuple(left))
+            self._snap_status = {
+                "left": "Press DONE to enable snap",
+                "right": "Press DONE to enable snap",
+            }
+            marker = getattr(self, f"{side}_marker_global", None)
+            if marker is not None:
+                self._set_panel_view_center(side, tuple(marker))
+            if announce:
+                self._set_stage_status(f"{side.upper()} SELECTED")
+            self.redraw_gui()
+
+        def _start_manual_workflow(self) -> None:
+            self._manual_button_flash_until = time.monotonic() + 0.38
+            side = self._manual_active_side if self._manual_active_side in ("left", "right") else "left"
+            self._set_manual_side(side, announce=False)
             self._set_stage_status("MANUAL ALIGNMENT STARTED")
             self.redraw_gui()
 
-        def _complete_left(self) -> None:
-            if self._workflow_stage != "absolute_left":
+        def _select_manual_side(self, side: str) -> None:
+            if self._workflow_stage == "auto":
+                self._manual_button_flash_until = time.monotonic() + 0.24
+            if self._workflow_stage == "relative":
+                self._set_stage_status("PRESS DONE AGAIN BEFORE SWITCHING ABSOLUTE SIDE")
+                self.redraw_gui()
                 return
-            self._main_drag_side = None
-            self._workflow_stage = "absolute_right"
-            self.current_state = self.STATE_WAIT_RIGHT
-            right = getattr(self, "right_marker_global", None)
-            if right is not None:
-                self._set_panel_view_center("right", tuple(right))
-            self._set_stage_status("LEFT ABSOLUTE LOCATION LOCKED")
-            self.redraw_gui()
+            self._set_manual_side(side)
 
-        def _complete_right(self) -> None:
-            if self._workflow_stage != "absolute_right":
+        def _toggle_done(self) -> None:
+            if self._workflow_stage == "auto":
+                self._set_stage_status("START MANUAL ALIGNMENT FIRST")
+                self.redraw_gui()
                 return
+            if self._workflow_stage == "relative":
+                self._set_manual_side(self._manual_active_side, announce=False)
+                self._set_stage_status("DONE RELEASED - ABSOLUTE EDITING ENABLED")
+                self.redraw_gui()
+                return
+            if self.left_marker_global is None or self.right_marker_global is None:
+                self._set_stage_status("LEFT AND RIGHT MARKERS MUST BOTH EXIST BEFORE DONE")
+                self.redraw_gui()
+                return
+            active = self._active_absolute_side()
+            if active is not None:
+                self._manual_active_side = active
             self._main_drag_side = None
+            self._panel_drag_side = None
+            self._panel_drag_mode = None
             self._workflow_stage = "relative"
             self.current_state = self.STATE_FINISHED
             self._manual_edit_enabled = True
             self._snap_status = {"left": "Ready", "right": "Ready"}
-            self._set_stage_status("RIGHT ABSOLUTE LOCATION LOCKED")
+            self._set_stage_status("MANUAL ABSOLUTE PLACEMENT MARKED DONE")
+            self.redraw_gui()
+
+        def _nudge_active_side(self, dx: int, dy: int, *, coarse: bool = False) -> None:
+            side = self._active_absolute_side()
+            if side is None:
+                if self._workflow_stage == "relative":
+                    self._set_stage_status("PRESS DONE AGAIN BEFORE NUDGING LEFT/RIGHT")
+                    self.redraw_gui()
+                return
+            marker = getattr(self, f"{side}_marker_global", None)
+            if marker is None:
+                return
+            step = 10.0 if coarse else 1.0
+            new_marker = (float(marker[0]) + step * dx, float(marker[1]) + step * dy)
+            self._move_side_geometry(side, new_marker, update_panel_view=True)
+            setattr(self, f"{side}_was_manual", True)
+            setattr(self, f"{side}_resolved_success", True)
+            label = "10 px" if coarse else "1 px"
+            self._set_stage_status(f"{side.upper()} NUDGED {label}")
             self.redraw_gui()
 
         def _restore_auto_defaults(self) -> None:
             self._workflow_stage = "auto"
+            self._manual_active_side = "left"
             self._main_drag_side = None
-            self._snap_status = {"left": "Available after absolute placement", "right": "Available after absolute placement"}
+            self._snap_status = {"left": "Available after DONE", "right": "Available after DONE"}
             super()._restore_auto_defaults()
             self._set_stage_status("AUTOMATIC BOXES RESTORED")
             self.redraw_gui()
@@ -456,7 +818,7 @@ def install_alignment_marker_ui_upgrade(pipeline: Any) -> None:
                 self.redraw_gui()
                 return
             self._snap_busy = True
-            self._snap_status[side] = "Searching local edges..."
+            self._snap_status[side] = "Searching nearby edges + vertices..."
             self.redraw_gui()
             try:
                 # The marker-review object may be backed by a virtual stitched
@@ -468,7 +830,7 @@ def install_alignment_marker_ui_upgrade(pipeline: Any) -> None:
                 points = [point for _key, corners in items for point in corners]
                 centers = [point for key, point in squares.items() if key != ("area", 0)]
                 pitch = max(8.0, _nearest_neighbor_pitch(centers))
-                margin = int(np.clip(round(1.8 * pitch), 80, 900))
+                margin = int(np.clip(round(2.7 * pitch), 110, 1400))
                 x0 = max(0, int(math.floor(min([p[0] for p in points] + [marker[0]]) - margin)))
                 y0 = max(0, int(math.floor(min([p[1] for p in points] + [marker[1]]) - margin)))
                 x1 = min(self.orig_w, int(math.ceil(max([p[0] for p in points] + [marker[0]]) + margin)))
@@ -490,9 +852,12 @@ def install_alignment_marker_ui_upgrade(pipeline: Any) -> None:
                     self._set_stage_status(f"{side.upper()} SNAP NOT APPLIED")
                 else:
                     self._apply_snap_result(side, result)
+                    svd_note = ""
+                    if result.get("svd_refined"):
+                        svd_note = f"  SVD {int(result.get('svd_vertices', 0))}v rms {float(result.get('svd_rms', 0.0)):.1f}"
                     self._snap_status[side] = (
                         f"score {result['score']:.2f}  move ({result['dx']:+.1f}, {result['dy']:+.1f}) px  "
-                        f"rot {result['angle_deg']:+.1f} deg  scale {result['scale']:.3f}"
+                        f"rot {result['angle_deg']:+.1f} deg  scale {result['scale']:.3f}{svd_note}"
                     )
                     self._set_stage_status(f"{side.upper()} TEMPLATE SNAPPED TO LOCAL BOX EDGES")
             except Exception as exc:
@@ -536,32 +901,53 @@ def install_alignment_marker_ui_upgrade(pipeline: Any) -> None:
             button = self._upgrade_buttons[key]
             x1, y1, x2, y2 = button["box"]
             stage = self._workflow_stage
+            active_side = self._manual_active_side
             enabled = True
-            completed = False
-            if key == "done_left":
-                enabled = stage == "absolute_left"
-                completed = stage in ("absolute_right", "relative")
-            elif key == "done_right":
-                enabled = stage == "absolute_right"
-                completed = stage == "relative"
+            pressed = False
 
-            if key == "manual":
+            if key in ("left", "right"):
+                enabled = stage not in ("auto", "relative")
+                pressed = stage != "auto" and active_side == key
+                fill = (0, 103, 150) if pressed else ((0, 135, 188) if enabled else (58, 58, 58))
+            elif key == "done":
+                enabled = stage != "auto"
+                pressed = stage == "relative"
+                fill = (0, 100, 72) if pressed else ((0, 142, 98) if enabled else (58, 58, 58))
+            elif key == "manual":
                 flashing = time.monotonic() < self._manual_button_flash_until
-                fill = (55, 220, 75) if flashing else ((0, 145, 35) if stage != "auto" else (0, 112, 28))
-            elif key in ("done_left", "done_right"):
-                fill = (0, 132, 95) if enabled else ((0, 92, 58) if completed else (58, 58, 58))
+                pressed = stage != "auto"
+                fill = (55, 220, 75) if flashing else ((0, 128, 32) if pressed else (0, 112, 28))
             elif key == "reset":
                 fill = (0, 112, 130)
             else:
                 enabled = stage in ("auto", "relative")
                 fill = (42, 62, 150) if enabled else (58, 58, 58)
+
             border = (150, 255, 205) if enabled else (95, 95, 95)
-            cv2.rectangle(self.canvas, (x1, y1), (x2, y2), fill, -1)
-            cv2.rectangle(self.canvas, (x1, y1), (x2, y2), border, 1)
+            # Pressed controls are drawn inset with a darker top/left edge so they
+            # visibly look pushed down instead of only changing color.
+            if pressed:
+                cv2.rectangle(self.canvas, (x1, y1), (x2, y2), (38, 38, 42), -1)
+                draw_box = (x1 + 2, y1 + 2, x2, y2)
+            else:
+                draw_box = (x1, y1, x2, y2)
+            dx1, dy1, dx2, dy2 = draw_box
+            cv2.rectangle(self.canvas, (dx1, dy1), (dx2, dy2), fill, -1)
+            cv2.rectangle(self.canvas, (dx1, dy1), (dx2, dy2), border, 1)
             label = button["label"]
-            font_scale = 0.43 if key != "accept" else 0.40
-            text = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)[0]
-            cv2.putText(self.canvas, label, (x1 + max(5, (x2 - x1 - text[0]) // 2), y1 + (y2 - y1 + text[1]) // 2), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (245, 245, 245), 1, cv2.LINE_AA)
+            font_scale = 0.42 if key != "accept" else 0.38
+            text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)[0]
+            text_y = dy1 + (dy2 - dy1 + text_size[1]) // 2 + (1 if pressed else 0)
+            cv2.putText(
+                self.canvas,
+                label,
+                (dx1 + max(5, (dx2 - dx1 - text_size[0]) // 2), text_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale,
+                (245, 245, 245),
+                1,
+                cv2.LINE_AA,
+            )
 
         def redraw_gui(self) -> None:
             if not getattr(self, "_alignment_marker_upgrade_ready", False):
@@ -600,9 +986,9 @@ def install_alignment_marker_ui_upgrade(pipeline: Any) -> None:
             cv2.rectangle(self.canvas, (0, bottom_y), (self.canvas_w, self.canvas_h), (24, 24, 27), -1)
             cv2.putText(self.canvas, "Full wafer: click/drag absolute location   |   Panels: body move, corners scale, circle rotate", (14, bottom_y + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (195, 195, 195), 1, cv2.LINE_AA)
             self._layout_upgrade_buttons()
-            for key in ("manual", "done_left", "done_right", "reset", "accept"):
+            for key in ("manual", "left", "right", "done", "reset", "accept"):
                 self._draw_bottom_button(key)
-            cv2.putText(self.canvas, "Keys: M/L manual  |  P reset  |  Enter/A accept when ready  |  Q/Esc exit", (14, self.canvas_h - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.32, (150, 150, 150), 1, cv2.LINE_AA)
+            cv2.putText(self.canvas, "Keys: M manual | L/R select | D done toggle | arrows 1 px | Shift+arrows 10 px | P reset | Enter/A accept | Q/Esc exit", (14, self.canvas_h - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.30, (150, 150, 150), 1, cv2.LINE_AA)
             cv2.imshow("Large Wafer Tester", self.canvas)
 
         def handle_click(self, event, x, y, flags, param) -> None:
@@ -614,17 +1000,19 @@ def install_alignment_marker_ui_upgrade(pipeline: Any) -> None:
                 if y >= image_bottom:
                     if _inside(self._upgrade_buttons["manual"]["box"], x, y):
                         self._start_manual_workflow()
-                    elif _inside(self._upgrade_buttons["done_left"]["box"], x, y):
-                        self._complete_left()
-                    elif _inside(self._upgrade_buttons["done_right"]["box"], x, y):
-                        self._complete_right()
+                    elif _inside(self._upgrade_buttons["left"]["box"], x, y):
+                        self._select_manual_side("left")
+                    elif _inside(self._upgrade_buttons["right"]["box"], x, y):
+                        self._select_manual_side("right")
+                    elif _inside(self._upgrade_buttons["done"]["box"], x, y):
+                        self._toggle_done()
                     elif _inside(self._upgrade_buttons["reset"]["box"], x, y):
                         self._restore_auto_defaults()
                     elif _inside(self._upgrade_buttons["accept"]["box"], x, y):
                         if self._workflow_stage in ("auto", "relative"):
                             self.running = False
                         else:
-                            self._set_stage_status("FINISH LEFT AND RIGHT ABSOLUTE PLACEMENT FIRST")
+                            self._set_stage_status("PRESS DONE BEFORE ACCEPT / EXIT")
                             self.redraw_gui()
                     return
 
@@ -679,19 +1067,24 @@ def install_alignment_marker_ui_upgrade(pipeline: Any) -> None:
                 if self._manual_button_flash_until and time.monotonic() >= self._manual_button_flash_until:
                     self._manual_button_flash_until = 0.0
                     self.redraw_gui()
-                if key in (13, 32, ord("a"), ord("A")):
+
+                arrow = _decode_arrow_key(key) if key != -1 else None
+                if arrow is not None:
+                    self._nudge_active_side(arrow[0], arrow[1], coarse=_shift_key_down())
+                elif key in (13, ord("a"), ord("A")):
                     if self._workflow_stage in ("auto", "relative") and self.left_marker_global is not None and self.right_marker_global is not None:
                         self.running = False
                     elif key != -1:
-                        self._set_stage_status("FINISH LEFT AND RIGHT ABSOLUTE PLACEMENT FIRST")
+                        self._set_stage_status("PRESS DONE BEFORE ACCEPT / EXIT")
                         self.redraw_gui()
-                elif key in (ord("m"), ord("M"), ord("l"), ord("L")):
+                elif key in (ord("m"), ord("M")):
                     self._start_manual_workflow()
+                elif key in (ord("l"), ord("L")):
+                    self._select_manual_side("left")
                 elif key in (ord("r"), ord("R")):
-                    if self._workflow_stage == "absolute_left":
-                        self._complete_left()
-                    elif self._workflow_stage == "absolute_right":
-                        self._complete_right()
+                    self._select_manual_side("right")
+                elif key in (ord("d"), ord("D"), 32):
+                    self._toggle_done()
                 elif key in (ord("p"), ord("P")):
                     self._restore_auto_defaults()
                 elif key in (27, ord("q"), ord("Q")):
