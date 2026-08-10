@@ -39,8 +39,9 @@ extracted_cells\
 │  └─ previews\
 ├─ Wafer_mesaetch\
 ├─ Wafer_substrateetch\
-├─ Wafer_LOR1\
-└─ Wafer_LOR2\
+├─ LORs_LOR-1\
+└─ LORs_LOR-2\
+└─ ...
 ```
 
 ### 2. Defect detection and review
@@ -90,7 +91,7 @@ Launch the device-index defect viewer:
 python .\device_index_defect_viewer.py
 ```
 
-The viewer groups the same device index across all extracted wafers and displays the available images, defect overlays, wafer labels, image dimensions, and defect counts.
+The viewer groups the same device index across all extracted wafers and displays the available images, defect overlays, wafer labels, image dimensions, and defect counts. If `folder_name` entries are present in `batch_wafers.txt`, a **Folder group** dropdown can limit the view to one declared group; **All folders** shows everything.
 
 To print a dataset summary without opening the UI:
 
@@ -101,6 +102,7 @@ python .\device_index_defect_viewer.py --summary
 Useful UI controls include:
 
 ```text
+Folder group    All folders, or one declared folder_name group
 /               Focus device-index search
 Left/Right      Previous or next device index
 O               Toggle defect overlays
@@ -187,17 +189,17 @@ The main files are:
 
 20. subtract_defects.py                     Stage 3 GDS subtraction
 21. remove_hanging_gridlines.py             Removes floating grid line parts
-22. batch_wafers_parser.py                  Compact and legacy batch-file parser
+22. batch_wafers_parser.py                  Strict path-based batch-file parser
 23. wafer_run_layout.py                     Per-wafer output path helpers
 24. h2p_progress.py                         Shared command-line progress reporting
 25. migrate_combined_extracted_cells.py     Migrates older combined extraction output
 
 26. config.json                             Geometry and stitching configuration
-27. batch_wafers.txt                        Compact wafer-name list
+27. batch_wafers.txt                        Wafer-name/path definitions
 28. future_design.gds                       Active future-design GDS
 29. semiconductor_design.gds                Legacy GDS used by the old workflow
 
-30. assets\h2pLogo.png                      H2P logo used by the device viewer
+30. assets\h2pLogo.png                      H2P logo used by the UIs
 ```
 
 ## Configuration
@@ -233,27 +235,24 @@ tile_x001_y002.jpg
 
 ## Batch file
 
-The preferred `batch_wafers.txt` format is one wafer/process name per line:
+Each active entry in `batch_wafers.txt` is an exact two-line `name`/`path` or `folder_name`/`path` pair:
 
 ```text
-topcontact
-mesaetch
-substrateetch
-LOR1
-LOR2
+name: mesaetch
+path: C:\Users\reala\Documents\code\h2p_device_view_temp\wafer_n_mesaetch
+
+name: substrateetch
+path: C:\Users\reala\Documents\code\h2p_device_view_temp\wafer_n_substrateetch
+
+folder_name: LORs
+path: C:\Users\reala\Documents\code\h2p_device_view_temp\LOR
 ```
 
-The corresponding tile directories should be located in the repository as:
+`name` points to one folder of tiles. Plain names such as `mesaetch` are output as `Wafer_mesaetch`; names that already contain a `Wafer_` token are kept as written. The tile path may be outside the repository.
 
-```text
-folder_of_tiles_topcontact\
-folder_of_tiles_mesaetch\
-folder_of_tiles_substrateetch\
-folder_of_tiles_LOR1\
-folder_of_tiles_LOR2\
-```
+`folder_name` points to a folder containing one direct child folder per wafer. The parent may contain only directories, and those child folders may contain files but no subfolders. Each wafer is named `{folder_name}_{child_folder}` (for example, `LORs_2-LOR`). Image extensions and image counts are not restricted.
 
-Blank lines and comments beginning with `#` are ignored.
+Blank lines and full-line comments beginning with `#` are ignored. Every other line must follow the declaration/path pairing above; if not, the parser reports the first bad physical line and stops before processing any wafers.
 
 ## Manual alignment controls
 
