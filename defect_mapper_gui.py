@@ -32,6 +32,10 @@ Controls:
 
 from __future__ import annotations
 
+from h2p_ui_branding import install_global_branding as _install_h2p_ui_branding
+_install_h2p_ui_branding()
+
+
 import copy
 import io
 import json

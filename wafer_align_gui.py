@@ -1,3 +1,7 @@
+
+from h2p_ui_branding import install_global_branding as _install_h2p_ui_branding
+_install_h2p_ui_branding()
+
 import numpy as np
 import cv2
 import tkinter as tk
@@ -39,22 +43,38 @@ class ManualAlignApp:
         self.render()
 
     def setup_ui(self):
+        self.root._h2p_embedded_branding = True
+        self.root._h2p_alignment_header_v1 = True
         self.root.title("Interactive GDS Alignment Calibration Workspace")
-        self.root.geometry("1420x680")
+        self.root.geometry("1420x724")
         self.root.resizable(False, False)
 
         style = ttk.Style()
         style.theme_use("clam")
 
+        # Dedicated logo header: it consumes its own row and never overlays the wafer.
+        header = tk.Frame(self.root, height=44, bg="#FFFFFF")
+        header.grid(row=0, column=0, columnspan=3, sticky="ew")
+        header.grid_propagate(False)
+        try:
+            from pathlib import Path as _Path
+            logo_path = _Path(__file__).resolve().parent / "assets" / "h2pLogo.png"
+            logo_image = Image.open(logo_path).convert("RGBA")
+            logo_image.thumbnail((76, 36), Image.Resampling.LANCZOS)
+            self._h2p_alignment_logo = ImageTk.PhotoImage(logo_image, master=self.root)
+            tk.Label(header, image=self._h2p_alignment_logo, bg="#FFFFFF", bd=0).pack(pady=(3, 0))
+        except Exception:
+            pass
+
         self.sidebar = ttk.Frame(self.root, padding=15, width=340)
-        self.sidebar.grid(row=0, column=0, sticky="ns", padx=5, pady=5)
+        self.sidebar.grid(row=1, column=0, sticky="ns", padx=5, pady=5)
         self.sidebar.grid_propagate(False)
 
         self.canvas = tk.Canvas(self.root, width=self.V_w, height=self.V_h, bg="#1e1e1e", highlightthickness=0)
-        self.canvas.grid(row=0, column=1, padx=5, pady=10)
+        self.canvas.grid(row=1, column=1, padx=5, pady=10)
 
         self.marker_panel = ttk.Frame(self.root, padding=10, width=250)
-        self.marker_panel.grid(row=0, column=2, sticky="ns", padx=5, pady=5)
+        self.marker_panel.grid(row=1, column=2, sticky="ns", padx=5, pady=5)
         self.marker_panel.grid_propagate(False)
 
         ttk.Label(self.marker_panel, text="Marker Alignment Assistant", font=("Helvetica", 11, "bold")).pack(anchor="n", pady=(0, 10))

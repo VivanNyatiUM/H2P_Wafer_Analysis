@@ -1,4 +1,4 @@
-﻿r"""Production-style cross-wafer device-index defect viewer for H2P.
+r"""Production-style cross-wafer device-index defect viewer for H2P.
 
 The first screen presents the GDS-derived wafer device map. Selecting a device
 opens the matching crop from every wafer, with reviewed or automatic defect
@@ -20,6 +20,10 @@ Useful variants::
 
 from __future__ import annotations
 
+from h2p_ui_branding import install_global_branding as _install_h2p_ui_branding
+_install_h2p_ui_branding()
+
+
 import argparse
 import ctypes
 import json
@@ -39,7 +43,9 @@ from tkinter import messagebox, ttk
 
 
 APP_TITLE = "H2P Device Index Defect Viewer"
-APP_VERSION = "production-ui-v2-2026-07-27"
+APP_VERSION = "production-ui-v5-2026-08-10"
+HEADER_STATUS_CHIPS_DPI_SAFE_V1 = True
+ALL_FOLDER_GROUP_LABEL = "All folders"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 CELL_RE = re.compile(r"(?:^|_)cell_(\d+)-(\d+)$", re.IGNORECASE)
 DEFAULT_LOGO_NAME = "h2pLogo.png"
@@ -107,6 +113,7 @@ class DeviceIndex:
 @dataclass
 class WaferDeviceEntry:
     wafer_id: str
+    folder_group: str | None
     device: DeviceIndex
     image_path: Path
     defects: list[dict[str, Any]]
@@ -118,6 +125,8 @@ class WaferDeviceEntry:
 @dataclass
 class Catalog:
     wafer_ids: list[str]
+    wafer_groups: dict[str, str | None]
+    folder_groups: list[str]
     by_device: dict[DeviceIndex, list[WaferDeviceEntry]]
     warnings: list[str]
 
@@ -153,54 +162,30 @@ def _device_from_stem(value: str | Path) -> DeviceIndex | None:
     return DeviceIndex(int(match.group(1)), int(match.group(2)))
 
 
-def _fallback_parse_batch(batch_path: Path) -> list[str]:
-    result: list[str] = []
-    if not batch_path.exists():
-        return result
-    lines: list[str] = []
-    for raw in batch_path.read_text(encoding="utf-8-sig").splitlines():
-        value = raw.split("#", 1)[0].strip().strip('"').strip("'")
-        if value:
-            lines.append(value)
-    i = 0
-    while i < len(lines):
-        value = lines[i]
-        if value.endswith(":"):
-            result.append(value[:-1].strip())
-            i += 4
-        else:
-            result.append(value if value.casefold().startswith("wafer_") else f"Wafer_{value}")
-            i += 1
-    return result
+def load_wafer_records(batch_path: Path, extracted_root: Path) -> list[tuple[str, str | None]]:
+    from batch_wafers_parser import parse_batch_file  # type: ignore
 
-
-def load_wafer_ids(batch_path: Path, extracted_root: Path) -> list[str]:
-    wafer_ids: list[str] = []
-    try:
-        from batch_wafers_parser import parse_batch_file  # type: ignore
-
-        if batch_path.exists():
-            wafer_ids = [str(item["id"]) for item in parse_batch_file(batch_path)]
-    except Exception:
-        wafer_ids = _fallback_parse_batch(batch_path)
+    records: list[tuple[str, str | None]] = []
+    for item in parse_batch_file(batch_path):
+        wafer_id = str(item["id"])
+        folder_group = str(item.get("folder_group", "")).strip() or None
+        records.append((wafer_id, folder_group))
 
     discovered: list[str] = []
     if extracted_root.exists():
         discovered = sorted(
-            p.name
-            for p in extracted_root.iterdir()
-            if p.is_dir() and p.name.casefold().startswith("wafer_")
+            (p.name for p in extracted_root.iterdir() if p.is_dir()),
+            key=str.casefold,
         )
 
     seen: set[str] = set()
-    merged: list[str] = []
-    for wafer_id in [*wafer_ids, *discovered]:
+    merged: list[tuple[str, str | None]] = []
+    for wafer_id, folder_group in [*records, *((name, None) for name in discovered)]:
         key = wafer_id.casefold()
         if key not in seen:
             seen.add(key)
-            merged.append(wafer_id)
+            merged.append((wafer_id, folder_group))
     return merged
-
 
 def _load_json(path: Path) -> Any:
     try:
@@ -279,7 +264,10 @@ def _load_gds_size_um(wafer_dir: Path, image_path: Path) -> tuple[float, float] 
 
 
 def build_catalog(extracted_root: Path, batch_path: Path, source: str) -> Catalog:
-    wafer_ids = load_wafer_ids(batch_path, extracted_root)
+    wafer_records = load_wafer_records(batch_path, extracted_root)
+    wafer_ids = [wafer_id for wafer_id, _group in wafer_records]
+    wafer_groups = {wafer_id: group for wafer_id, group in wafer_records}
+    folder_groups = list(dict.fromkeys(group for _wafer_id, group in wafer_records if group))
     by_device: dict[DeviceIndex, list[WaferDeviceEntry]] = defaultdict(list)
     warnings: list[str] = []
 
@@ -317,6 +305,7 @@ def build_catalog(extracted_root: Path, batch_path: Path, source: str) -> Catalo
             by_device[device].append(
                 WaferDeviceEntry(
                     wafer_id=wafer_id,
+                    folder_group=wafer_groups.get(wafer_id),
                     device=device,
                     image_path=image_path,
                     defects=defects,
@@ -329,7 +318,7 @@ def build_catalog(extracted_root: Path, batch_path: Path, source: str) -> Catalo
     order = {wafer.casefold(): i for i, wafer in enumerate(wafer_ids)}
     for entries in by_device.values():
         entries.sort(key=lambda e: (order.get(e.wafer_id.casefold(), 10**9), e.wafer_id.casefold()))
-    return Catalog(wafer_ids=wafer_ids, by_device=dict(by_device), warnings=warnings)
+    return Catalog(wafer_ids=wafer_ids, wafer_groups=wafer_groups, folder_groups=folder_groups, by_device=dict(by_device), warnings=warnings)
 
 
 # ---------------------------------------------------------------------------
@@ -460,6 +449,8 @@ class TogglePill(tk.Frame):
         super().__init__(master, bg=C.SURFACE_2)
         self.variable = variable
         self.command = command
+        self.label = text
+        self._trace_id = self.variable.trace_add("write", self._on_variable_changed)
         self.button = tk.Button(
             self,
             text="",
@@ -473,24 +464,40 @@ class TogglePill(tk.Frame):
             pady=7,
         )
         self.button.pack()
-        self.label = text
+        self.bind("<Destroy>", self._on_destroy, add="+")
         self._refresh()
 
     def _toggle(self) -> None:
         self.variable.set(not self.variable.get())
-        self._refresh()
         self.command()
 
-    def _refresh(self) -> None:
-        on = self.variable.get()
-        self.button.configure(
-            text=f"{'â—' if on else 'â—‹'}  {self.label}",
-            bg=C.ACCENT_DARK if on else C.SURFACE_3,
-            activebackground=C.ACCENT_DARK if on else C.BORDER,
-            fg=C.ACCENT if on else C.TEXT_2,
-            activeforeground=C.ACCENT if on else C.TEXT,
-        )
+    def _on_variable_changed(self, *_args: object) -> None:
+        try:
+            if self.winfo_exists():
+                self._refresh()
+        except tk.TclError:
+            pass
 
+    def _on_destroy(self, event: tk.Event) -> None:
+        if event.widget is not self or not self._trace_id:
+            return
+        try:
+            self.variable.trace_remove("write", self._trace_id)
+        except tk.TclError:
+            pass
+        self._trace_id = ""
+
+    def _refresh(self) -> None:
+        on = bool(self.variable.get())
+        state = "ON" if on else "OFF"
+        self.button.configure(
+            text=f"{self.label}: {state}",
+            width=max(18, len(self.label) + 7),
+            bg=C.GREEN_DARK if on else C.SURFACE_3,
+            activebackground=C.GREEN_DARK if on else C.BORDER,
+            fg=C.GREEN if on else C.TEXT_2,
+            activeforeground=C.GREEN if on else C.TEXT,
+        )
 
 class StatCard(tk.Frame):
     def __init__(self, master: tk.Misc, label: str, value: str, accent: str = C.ACCENT) -> None:
@@ -639,9 +646,9 @@ class FullImageViewer(tk.Toplevel):
 
         HoverButton(header, text="Fit", command=self._fit, padx=12, pady=6).pack(side="right", padx=(6, 0))
         HoverButton(header, text="100%", command=lambda: self._set_scale(1.0), padx=12, pady=6).pack(side="right", padx=6)
-        HoverButton(header, text="ï¼‹", command=lambda: self._zoom(1.22), padx=11, pady=6).pack(side="right", padx=3)
-        HoverButton(header, text="ï¼", command=lambda: self._zoom(1 / 1.22), padx=11, pady=6).pack(side="right", padx=3)
-        TogglePill(header, "Overlay", self.overlay_enabled, self._refresh_image).pack(side="right", padx=10)
+        HoverButton(header, text="+", command=lambda: self._zoom(1.22), padx=11, pady=6).pack(side="right", padx=3)
+        HoverButton(header, text="-", command=lambda: self._zoom(1 / 1.22), padx=11, pady=6).pack(side="right", padx=3)
+        TogglePill(header, "Defect overlay", self.overlay_enabled, self._refresh_image).pack(side="right", padx=10)
 
         body = tk.Frame(self, bg=C.BG)
         body.pack(fill="both", expand=True)
@@ -760,6 +767,7 @@ class DeviceViewerApp:
         self.overlay_enabled_var = tk.BooleanVar(value=True)
         self.overlay_opacity_var = tk.DoubleVar(value=0.18)
         self.search_var = tk.StringVar(value="")
+        self.folder_group_var = tk.StringVar(value=ALL_FOLDER_GROUP_LABEL)
         self.selected_device: DeviceIndex | None = None
         self._photos: list[ImageTk.PhotoImage] = []
         self._logo_photo: ImageTk.PhotoImage | None = None
@@ -805,9 +813,8 @@ class DeviceViewerApp:
         )
 
     def _build_shell(self) -> None:
-        self.header = tk.Frame(self.root, bg=C.SURFACE, height=86, padx=22, pady=12)
+        self.header = tk.Frame(self.root, bg=C.SURFACE, padx=22, pady=12)
         self.header.pack(fill="x")
-        self.header.pack_propagate(False)
 
         brand = tk.Frame(self.header, bg=C.SURFACE)
         brand.pack(side="left", fill="y")
@@ -830,9 +837,10 @@ class DeviceViewerApp:
         self.footer.pack_propagate(False)
         self.status_label = tk.Label(self.footer, text="", bg=C.SURFACE, fg=C.TEXT_3, font=_font(8))
         self.status_label.pack(side="left", pady=7)
-        tk.Label(self.footer, text=f"{APP_VERSION}  Â·  Esc back  Â·  â†/â†’ navigate  Â·  O overlay  Â·  / search", bg=C.SURFACE, fg=C.TEXT_3, font=_font(8)).pack(side="right", pady=7)
+        tk.Label(self.footer, text=f"{APP_VERSION}  |  Esc: back  |  Left/Right: navigate  |  O: toggle overlay  |  /: search", bg=C.SURFACE, fg=C.TEXT_3, font=_font(8)).pack(side="right", pady=7)
 
     def _build_logo(self, master: tk.Misc) -> None:
+        self.root._h2p_embedded_branding = True
         holder = tk.Frame(master, bg=C.WHITE, width=106, height=56, padx=8, pady=6)
         holder.pack(side="left", fill="y")
         holder.pack_propagate(False)
@@ -852,7 +860,7 @@ class DeviceViewerApp:
 
     @staticmethod
     def _header_chip(master: tk.Misc, label: str, value: str, fg: str, bg: str) -> tk.Frame:
-        frame = tk.Frame(master, bg=bg, padx=11, pady=7)
+        frame = tk.Frame(master, bg=bg, padx=12, pady=9)
         tk.Label(frame, text=label, bg=bg, fg=fg, font=_font(7, "bold")).pack(anchor="w")
         tk.Label(frame, text=value, bg=bg, fg=C.TEXT, font=_font(9, "bold")).pack(anchor="w")
         return frame
@@ -884,13 +892,89 @@ class DeviceViewerApp:
     def _set_status(self, text: str) -> None:
         self.status_label.configure(text=text)
 
+    def _active_folder_group(self) -> str:
+        value = self.folder_group_var.get().strip()
+        return "" if value == ALL_FOLDER_GROUP_LABEL else value
+
+    def _entries_for_device(self, device: DeviceIndex) -> list[WaferDeviceEntry]:
+        entries = list(self.catalog.by_device.get(device, []))
+        group = self._active_folder_group()
+        if group:
+            entries = [entry for entry in entries if entry.folder_group == group]
+        return entries
+
+    def _scope_wafer_ids(self) -> list[str]:
+        group = self._active_folder_group()
+        if not group:
+            return list(self.catalog.wafer_ids)
+        return [
+            wafer_id
+            for wafer_id in self.catalog.wafer_ids
+            if self.catalog.wafer_groups.get(wafer_id) == group
+        ]
+
+    def _scope_devices(self) -> list[DeviceIndex]:
+        return [device for device in self.catalog.devices if self._entries_for_device(device)]
+
+    def _show_filtered_device(self, preferred_device: DeviceIndex) -> None:
+        if self._entries_for_device(preferred_device):
+            self.show_device(preferred_device)
+            return
+        devices = self._scope_devices()
+        if devices:
+            self.show_device(devices[0])
+        else:
+            self.show_grid()
+
+    def _build_folder_group_filter(self, master: tk.Misc, command: Callable[[], None]) -> tk.Frame | None:
+        if not self.catalog.folder_groups:
+            return None
+        shell = tk.Frame(
+            master,
+            bg=C.SURFACE_2,
+            highlightthickness=1,
+            highlightbackground=C.BORDER,
+            padx=8,
+            pady=4,
+        )
+        shell.pack(side="left", padx=(0, 10))
+        tk.Label(shell, text="FOLDER GROUP", bg=C.SURFACE_2, fg=C.TEXT_3, font=_font(7, "bold")).pack(side="left", padx=(0, 6))
+        menu = tk.OptionMenu(
+            shell,
+            self.folder_group_var,
+            ALL_FOLDER_GROUP_LABEL,
+            *self.catalog.folder_groups,
+            command=lambda _value: command(),
+        )
+        menu.configure(
+            bg=C.SURFACE_3,
+            activebackground=C.BORDER,
+            fg=C.TEXT,
+            activeforeground=C.TEXT,
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            width=max(12, min(24, max(len(value) for value in self.catalog.folder_groups))),
+            font=_font(9),
+            cursor="hand2",
+        )
+        menu["menu"].configure(
+            bg=C.SURFACE_3,
+            activebackground=C.ACCENT_DARK,
+            fg=C.TEXT,
+            activeforeground=C.ACCENT,
+            font=_font(9),
+        )
+        menu.pack(side="left")
+        return shell
+
     def _visible_devices(self) -> list[DeviceIndex]:
-        devices = self.catalog.devices
+        devices = self._scope_devices()
         if self.only_with_defects_var.get():
             devices = [
                 device
                 for device in devices
-                if any(entry.defects for entry in self.catalog.by_device.get(device, []))
+                if any(entry.defects for entry in self._entries_for_device(device))
             ]
         query = self.search_var.get().strip().casefold().replace("device", "").strip()
         if query:
@@ -904,7 +988,6 @@ class DeviceViewerApp:
             else:
                 devices = [d for d in devices if query in d.label.casefold()]
         return devices
-
     def show_grid(self) -> None:
         self.selected_device = None
         self._clear_page()
@@ -928,9 +1011,10 @@ class DeviceViewerApp:
 
         controls = tk.Frame(hero, bg=C.BG)
         controls.pack(side="right", pady=(4, 0))
+        self._build_folder_group_filter(controls, self.show_grid)
         search_shell = tk.Frame(controls, bg=C.SURFACE_2, highlightthickness=1, highlightbackground=C.BORDER, padx=10, pady=6)
         search_shell.pack(side="left", padx=(0, 10))
-        tk.Label(search_shell, text="âŒ•", bg=C.SURFACE_2, fg=C.TEXT_3, font=_font(15)).pack(side="left", padx=(0, 7))
+        tk.Label(search_shell, text="SEARCH", bg=C.SURFACE_2, fg=C.TEXT_3, font=_font(15)).pack(side="left", padx=(0, 7))
         self._search_entry = tk.Entry(
             search_shell,
             textvariable=self.search_var,
@@ -946,14 +1030,15 @@ class DeviceViewerApp:
         self._search_entry.bind("<KeyRelease>", self._schedule_grid_refresh)
         TogglePill(controls, "Defects only", self.only_with_defects_var, self.show_grid).pack(side="left")
 
-        entries = [entry for values in self.catalog.by_device.values() for entry in values]
+        scoped_devices = self._scope_devices()
+        entries = [entry for device in scoped_devices for entry in self._entries_for_device(device)]
         total_defects = sum(len(entry.defects) for entry in entries)
-        flagged_devices = sum(any(entry.defects for entry in self.catalog.by_device[d]) for d in self.catalog.devices)
+        flagged_devices = sum(any(entry.defects for entry in self._entries_for_device(device)) for device in scoped_devices)
         stats = tk.Frame(outer, bg=C.BG)
         stats.pack(fill="x", pady=(18, 18))
         stat_data = [
-            ("Wafers", str(len(self.catalog.wafer_ids)), C.ACCENT),
-            ("Device indices", str(len(self.catalog.devices)), C.BLUE),
+            ("Wafers", str(len(self._scope_wafer_ids())), C.ACCENT),
+            ("Device indices", str(len(scoped_devices)), C.BLUE),
             ("Flagged devices", str(flagged_devices), C.ORANGE),
             ("Defect regions", f"{total_defects:,}", C.RED),
         ]
@@ -998,7 +1083,7 @@ class DeviceViewerApp:
                 row=visual_row, column=0, padx=(0, 12), pady=7
             )
             for device in row_devices:
-                entries_for_device = self.catalog.by_device.get(device, [])
+                entries_for_device = self._entries_for_device(device)
                 crop_count = len(entries_for_device)
                 defect_count = sum(len(entry.defects) for entry in entries_for_device)
                 wafers_with_defects = sum(bool(entry.defects) for entry in entries_for_device)
@@ -1018,12 +1103,12 @@ class DeviceViewerApp:
                     sticky="nsew",
                 )
 
-        self._set_status(f"Showing {len(devices)} of {len(self.catalog.devices)} device indices")
+        self._set_status(f"Showing {len(devices)} of {len(scoped_devices)} device indices")
 
     @staticmethod
     def _legend_item(master: tk.Misc, color: str, text: str) -> tk.Frame:
         frame = tk.Frame(master, bg=C.SURFACE)
-        tk.Label(frame, text="â—", bg=C.SURFACE, fg=color, font=_font(10)).pack(side="left")
+        tk.Label(frame, text="o", bg=C.SURFACE, fg=color, font=_font(10)).pack(side="left")
         tk.Label(frame, text=text, bg=C.SURFACE, fg=C.TEXT_3, font=_font(8)).pack(side="left", padx=(4, 0))
         return frame
 
@@ -1051,10 +1136,9 @@ class DeviceViewerApp:
 
         nav = tk.Frame(outer, bg=C.BG)
         nav.pack(fill="x")
-        HoverButton(nav, text="â†  Device map", command=self.show_grid, bg=C.SURFACE_2, hover_bg=C.SURFACE_3).pack(side="left")
-        HoverButton(nav, text="â€¹", command=lambda: self._step_device(-1), padx=13).pack(side="left", padx=(10, 4))
-        HoverButton(nav, text="â€º", command=lambda: self._step_device(1), padx=13).pack(side="left", padx=4)
-
+        HoverButton(nav, text="Back to device map", command=self.show_grid, bg=C.SURFACE_2, hover_bg=C.SURFACE_3).pack(side="left")
+        HoverButton(nav, text="Previous", command=lambda: self._step_device(-1), padx=13).pack(side="left", padx=(10, 4))
+        HoverButton(nav, text="Next", command=lambda: self._step_device(1), padx=13).pack(side="left", padx=4)
         title_box = tk.Frame(nav, bg=C.BG)
         title_box.pack(side="left", padx=18)
         tk.Label(title_box, text=f"Device {device.label}", bg=C.BG, fg=C.TEXT, font=_font(23, "bold")).pack(anchor="w")
@@ -1062,10 +1146,11 @@ class DeviceViewerApp:
 
         tool = tk.Frame(nav, bg=C.BG)
         tool.pack(side="right")
-        TogglePill(tool, "Overlay", self.overlay_enabled_var, lambda: self._render_detail_cards(force=True)).pack(side="right", padx=(8, 0))
+        self._build_folder_group_filter(tool, lambda: self._show_filtered_device(device))
+        TogglePill(tool, "Defect overlay", self.overlay_enabled_var, lambda: self._render_detail_cards(force=True)).pack(side="right", padx=(8, 0))
         TogglePill(tool, "Defects only", self.detail_only_defects_var, lambda: self.show_device(device)).pack(side="right", padx=(8, 0))
 
-        entries = list(self.catalog.by_device.get(device, []))
+        entries = self._entries_for_device(device)
         if self.detail_only_defects_var.get():
             entries = [entry for entry in entries if entry.defects]
         self._detail_entries = entries
@@ -1078,7 +1163,7 @@ class DeviceViewerApp:
             ("Crops shown", str(len(entries)), C.ACCENT),
             ("Flagged wafers", str(flagged_wafers), C.ORANGE),
             ("Defect regions", str(total_defects), C.RED),
-            ("Coverage", f"{len(entries)}/{len(self.catalog.wafer_ids)}", C.BLUE),
+            ("Coverage", f"{len(entries)}/{len(self._scope_wafer_ids())}", C.BLUE),
         ]
         for col, (label, value, accent) in enumerate(detail_stats):
             stats.grid_columnconfigure(col, weight=1, uniform="detailstats")
@@ -1101,7 +1186,7 @@ class DeviceViewerApp:
             empty = tk.Frame(self._detail_content, bg=C.SURFACE, pady=100)
             empty.pack(fill="both", expand=True)
             tk.Label(empty, text="No wafer crops match this filter", bg=C.SURFACE, fg=C.TEXT, font=_font(16, "bold")).pack()
-            tk.Label(empty, text="Turn off â€˜Defects onlyâ€™ to show clean wafers.", bg=C.SURFACE, fg=C.TEXT_3, font=_font(10)).pack(pady=(5, 0))
+            tk.Label(empty, text="Turn off 'Defects only' to show clean wafers.", bg=C.SURFACE, fg=C.TEXT_3, font=_font(10)).pack(pady=(5, 0))
             return
 
         self.root.update_idletasks()
@@ -1192,7 +1277,7 @@ class DeviceViewerApp:
         footer = tk.Frame(card, bg=C.CARD, padx=14, pady=11)
         footer.pack(fill="x")
         tk.Label(footer, text=entry.image_path.name, bg=C.CARD, fg=C.TEXT_3, font=_font(8)).pack(side="left")
-        open_label = tk.Label(footer, text="OPEN  â†—", bg=C.CARD, fg=C.ACCENT, font=_font(8, "bold"), cursor="hand2")
+        open_label = tk.Label(footer, text="OPEN", bg=C.CARD, fg=C.ACCENT, font=_font(8, "bold"), cursor="hand2")
         open_label.pack(side="right")
         open_label.bind("<Button-1>", lambda _e, item=entry: FullImageViewer(self.root, item, self.overlay_opacity_var.get()))
 
@@ -1215,7 +1300,7 @@ class DeviceViewerApp:
     def _step_device(self, direction: int) -> None:
         if self.selected_device is None:
             return
-        devices = self.catalog.devices
+        devices = self._scope_devices()
         if not devices:
             return
         try:
@@ -1241,6 +1326,7 @@ def print_summary(catalog: Catalog) -> None:
     sizes = Counter(entry.image_size for entry in entries)
     square_count = sum(w == h for w, h in (entry.image_size for entry in entries))
     print(f"Wafers discovered: {len(catalog.wafer_ids)}")
+    print(f"Folder groups declared: {len(catalog.folder_groups)}")
     print(f"Device indices discovered: {len(catalog.by_device)}")
     print(f"Cell crops discovered: {len(entries)}")
     print(f"Square crops: {square_count}/{len(entries)}")
@@ -1301,7 +1387,12 @@ def main() -> int:
         print(f"ERROR: extracted root not found: {extracted_root}", file=sys.stderr)
         return 2
 
-    catalog = build_catalog(extracted_root, batch_path, args.source)
+    try:
+        catalog = build_catalog(extracted_root, batch_path, args.source)
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        print("Fix batch_wafers.txt and run the program again.", file=sys.stderr)
+        return 2
     if args.summary:
         print_summary(catalog)
         return 0
