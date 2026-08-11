@@ -75,7 +75,7 @@ For one wafer:
 python .\review_batch_wafers.py --wafer mesaetch --no-review --review-only --quick-review
 ```
 
-In this launcher, `--no-review` means “do not automatically add `--review-ui`.” The forwarded `--review-only` argument still opens the review-only UI.
+Note that `--no-review` means “do not automatically add `--review-ui`.” The forwarded `--review-only` argument still opens the review-only UI.
 
 To inspect the generated detector commands without running them:
 
