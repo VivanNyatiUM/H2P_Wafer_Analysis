@@ -118,39 +118,39 @@ python -m pip install numpy opencv-python pillow gdstk shapely
 The main files are:
 
 ```text
-1.  wafer_alignment_and_extraction.py       Stage 1 entry point
-2.  wafer_alignment_and_extraction_old.py   Underlying extraction implementation
-3.  future_design_adapter.py                Future-design alignment adapter
-4.  future_alignment.py                     Future-design alignment helpers
-5.  alignment_marker_ui_upgrade.py          Interactive alignment-marker manipulation UI
-6.  cell_boundary_alignment.py              Exact device-boundary alignment helpers
+1.  wafer_alignment_and_extraction.py       Stage 1 alignment and device-cell extraction
+2.  design_alignment.py                     Active design-alignment implementation
+3.  design_geometry.py                      Config-driven GDS geometry and design access
+4.  alignment_review.py                     Interactive alignment-marker review UI
+5.  future_alignment.py                     Design-alignment helper functions
+6.  cell_boundary_alignment.py              Exact physical device-boundary alignment helpers
 7.  centroid_algorithm.py                   Automatic wafer/cell feature alignment
 8.  coordinate_transformer.py               Pixel-to-GDS coordinate transforms
-9.  gds_parser.py                           GDS boundary and overlay parsing
+9.  gds_parser.py                           GDS compatibility shim
 10. illumination_stitching.py               Flat-field correction and tile stitching
 11. large_wafer_tester.py                   Large stitched-wafer inspection helpers
-12. wafer_align_gui.py                      Manual alignment interface
+12. wafer_align_gui.py                      Manual wafer-alignment interface
 13. wafer_metrology.py                      Wafer geometry and metrology helpers
 
 14. defect_detector.py                      Core automatic defect detector
 15. defect_detector_analysis_roi.py         Padded analysis ROI and inverse mapping
-16. defect_mapper_gui.py                    Fast review and labeling UI
-17. review_batch_wafers.py                  Runs the detector separately per wafer
-18. reviewed_defect_wafer_stitch.py         Creates reviewed wafer-level images
+16. defect_mapper_gui.py                    Defect review and labeling UI
+17. review_batch_wafers.py                  Runs detection/review per wafer or folder group
+18. reviewed_defect_wafer_stitch.py         Creates reviewed wafer-level inspection images
 19. device_index_defect_viewer.py           Cross-wafer device-index inspection UI
 
-20. subtract_defects.py                     Stage 3 GDS subtraction
-21. remove_hanging_gridlines.py             Removes floating grid line parts
-22. batch_wafers_parser.py                  Strict path-based batch-file parser
+20. subtract_defects.py                     Stage 4 GDS defect subtraction
+21. remove_hanging_gridlines.py             Removes floating/hanging grid-line remnants
+22. batch_wafers_parser.py                  Strict batch-file parser and wafer ID handling
 23. wafer_run_layout.py                     Per-wafer output path helpers
 24. h2p_progress.py                         Shared command-line progress reporting
-25. migrate_combined_extracted_cells.py     Migrates older combined extraction output
+25. h2p_ui_branding.py                      Shared H2P UI branding hooks
 
-26. config.json                             Geometry and stitching configuration
-27. batch_wafers.txt                        Wafer-name/path definitions
-29. semiconductor_design.gds                Legacy GDS used by the old workflow
+26. config.json                             GDS, geometry, and stitching configuration
+27. batch_wafers.txt                        Wafer and folder-group path definitions
+28. semiconductor_design.gds                Active GDS selected through config.json
 
-30. assets\h2pLogo.png                      H2P logo used by the UIs
+29. assets\h2pLogo.png                      H2P logo used by the UIs
 ```
 
 ## Configuration
