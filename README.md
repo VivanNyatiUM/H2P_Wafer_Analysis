@@ -25,6 +25,14 @@ path: C:\Users\reala\Documents\code\h2p_device_view_temp\LOR
 
 Blank lines and full-line comments beginning with `#` are ignored. Every other line must follow the declaration/path pairing above; if not, the parser reports the first bad physical line and stops before processing any wafers.
 
+If no names are given, the program defaults to all wafers in the batch file.
+
+Otherwise, the arguments `--wafer {wafer_name}` and `--folder {folder_name}` can be used to select specific wafers or folders of wafers and can be used in succession in the same command line input (for all stages aside from the device index viewer).
+
+Using `--dry-run` basically acts as a runtime test.
+
+## Workflow
+
 The Windows/PowerShell workflow is organized into three stages:
 
 1. Align each wafer and extract its device-cell images.
@@ -34,14 +42,6 @@ The Windows/PowerShell workflow is organized into three stages:
 and/or
 
 3. Subtract the reviewed defect regions from selected GDS layers.
-
-## Workflow
-
-If no names are given, the program defaults to all wafers in the batch file.
-
-Otherwise, the arguments `--wafer {wafer_name}` and `--folder {folder_name}` can be used to select specific wafers or folders of wafers and can be used in succession in the same command line input (for all stages aside from the device index viewer).
-
-Using `--dry-run` basically acts as a runtime test.
 
 ### 1. Alignment and device-image extraction
 
