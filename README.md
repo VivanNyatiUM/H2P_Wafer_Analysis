@@ -29,8 +29,6 @@ If no names are given, the program defaults to all wafers in the batch file.
 
 Otherwise, the arguments `--wafer {wafer_name}` and `--folder {folder_name}` can be used to select specific wafers or folders of wafers and can be used in succession in the same command line input (for all stages aside from the device index viewer).
 
-Using `--dry-run` basically acts as a runtime test.
-
 ## Workflow
 
 The Windows/PowerShell workflow is organized into three stages:
@@ -42,6 +40,8 @@ The Windows/PowerShell workflow is organized into three stages:
 and/or
 
 3. Subtract the reviewed defect regions from selected GDS layers.
+
+Using `--dry-run` basically acts as a runtime test.
 
 ### 1. Alignment and device-image extraction
 
