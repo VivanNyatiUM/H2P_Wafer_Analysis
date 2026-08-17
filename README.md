@@ -2,7 +2,7 @@
 
 This project processes stitched microscope images of H2P wafer device cells, detects physical defects, lets a reviewer correct the detections, maps the reviewed regions into GDS coordinates, and subtracts those regions from selected GDS layers.
 
-
+To download this, either use git clone https://github.com/VivanNyatiUM/H2P_Wafer_Analysis into your directory or download a ZIP file and extract it into your directory.
 
 ## Batch file
 
