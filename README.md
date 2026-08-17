@@ -2,6 +2,29 @@
 
 This project processes stitched microscope images of H2P wafer device cells, detects physical defects, lets a reviewer correct the detections, maps the reviewed regions into GDS coordinates, and subtracts those regions from selected GDS layers.
 
+
+
+## Batch file
+
+Each active entry in `batch_wafers.txt` is an exact two-line `name`/`path` or `folder_name`/`path` pair:
+
+```text
+name: mesaetch
+path: C:\Users\reala\Documents\code\h2p_device_view_temp\wafer_n_mesaetch
+
+name: substrateetch
+path: C:\Users\reala\Documents\code\h2p_device_view_temp\wafer_n_substrateetch
+
+folder_name: LORs
+path: C:\Users\reala\Documents\code\h2p_device_view_temp\LOR
+```
+
+`name` points to one folder of tiles. Plain names such as `mesaetch` are output as `Wafer_mesaetch`; names that already contain a `Wafer_` token are kept as written. The tile path may be outside the repository.
+
+`folder_name` points to a folder containing one direct child folder per wafer. The parent may contain only directories, and those child folders may contain files but no subfolders. Each wafer is named `{folder_name}_{child_folder}` (for example, `LORs_2-LOR`). Image extensions and image counts are not restricted.
+
+Blank lines and full-line comments beginning with `#` are ignored. Every other line must follow the declaration/path pairing above; if not, the parser reports the first bad physical line and stops before processing any wafers.
+
 The Windows/PowerShell workflow is organized into three stages:
 
 1. Align each wafer and extract its device-cell images.
@@ -14,35 +37,20 @@ and/or
 
 ## Workflow
 
+If no names are given, the program defaults to all wafers in the batch file.
+
+Otherwise, the arguments `--wafer {wafer_name}` and `--folder {folder_name}` can be used to select specific wafers or folders of wafers and can be used in succession in the same command line input (for all stages aside from the device index viewer).
+
+Using `--dry-run` basically acts as a runtime test.
+
 ### 1. Alignment and device-image extraction
 
 ```powershell
 python .\wafer_alignment_and_extraction.py -c
 ```
 
+
 The default extraction keeps the full, unzoomed, untrimmed device-cell crop so its pixel coordinates remain aligned with the GDS.
-
-For higher-quality, exact-boundary JPEG extraction (purely for individual device viewing and not for mask creation or defect detection):
-
-```powershell
-python .\wafer_alignment_and_extraction.py -c --bound --bound-exact-jpeg-decode --bound-workers 3
-```
-
-A batch device creation run writes every wafer into its own output directory:
-
-```text
-extracted_cells\
-├─ Wafer_topcontact\
-│  ├─ analysis_png\
-│  ├─ metadata\
-│  ├─ seam_masks\
-│  └─ previews\
-├─ Wafer_mesaetch\
-├─ Wafer_substrateetch\
-├─ LORs_LOR-1\
-└─ LORs_LOR-2\
-└─ ...
-```
 
 ### 2. Defect detection and review
 
@@ -52,36 +60,15 @@ Run detection and review for every wafer listed in `batch_wafers.txt`:
 python .\review_batch_wafers.py --quick-review
 ```
 
-The batch launcher uses `defect_detector_analysis_roi.py`. Automatic detection operates on a padded layer-5 device ROI, then inverse-maps every detected region into the original full layer-8 crop before GDS conversion.
-
-
-To process only one wafer:
-
-```powershell
-python .\review_batch_wafers.py --wafer mesaetch --quick-review
-```
+Removing `--quick-review` forces the user to select the type of defect.
 
 #### Review existing detections without rerunning detection
-
-For every wafer:
 
 ```powershell
 python .\review_batch_wafers.py --no-review --review-only --quick-review
 ```
 
-For one wafer:
-
-```powershell
-python .\review_batch_wafers.py --wafer mesaetch --no-review --review-only --quick-review
-```
-
 Note that `--no-review` means “do not automatically add `--review-ui`.” The forwarded `--review-only` argument still opens the review-only UI.
-
-To inspect the generated detector commands without running them:
-
-```powershell
-python .\review_batch_wafers.py --quick-review --dry-run
-```
 
 ### 3. Cross-wafer device inspection
 
@@ -99,54 +86,19 @@ To print a dataset summary without opening the UI:
 python .\device_index_defect_viewer.py --summary
 ```
 
-Useful UI controls include:
-
-```text
-Folder group    All folders, or one declared folder_name group
-/               Focus device-index search
-Left/Right      Previous or next device index
-O               Toggle defect overlays
-Mouse wheel     Zoom the selected image
-Mouse drag      Pan the selected image
-```
-
 ### 3. GDS subtraction
-
-For every wafer:
 
 ```powershell
 python .\subtract_defects.py -l num1 num2 ...
 ```
+
+Subtracts the defects from the combined layers of num1, num2, etc.
 
 Example:
 
 ```powershell
 python .\subtract_defects.py -l 3
 ```
-
-For a single wafer:
-
-```powershell
-python .\subtract_defects.py .\extracted_cells\Wafer_{name}\Wafer_{name}_device_defects.json -l num1 num2 ...
-```
-
-Example:
-
-```powershell
-python .\subtract_defects.py .\extracted_cells\Wafer_topcontact\Wafer_topcontact_device_defects.json -l 3
-```
-
-The reviewed-wafer stitcher writes wafer-level inspection images beside the reviewed JSON after the review UI closes.
-
-## Detection behavior
-
-The detector is recall-oriented. It is designed to find subtle particles, scratches, smears, holes, delamination, edge-clipped damage, and diffuse contamination while suppressing dense vertical device-line texture.
-
-Automatic detection uses an expanded device ROI for better border coverage. The full unzoomed crop remains the coordinate reference, and reviewed regions are mapped back into that coordinate system before GDS conversion.
-
-A human review step is still expected before GDS subtraction.
-
-Automatic proposals and manually added regions are preserved in the final reviewed JSON. The reviewed-wafer stitch distinguishes retained automatic detections from manually added detections.
 
 ## Requirements
 
@@ -233,56 +185,6 @@ tile_x001_y002.jpg
 ...
 ```
 
-## Batch file
-
-Each active entry in `batch_wafers.txt` is an exact two-line `name`/`path` or `folder_name`/`path` pair:
-
-```text
-name: mesaetch
-path: C:\Users\reala\Documents\code\h2p_device_view_temp\wafer_n_mesaetch
-
-name: substrateetch
-path: C:\Users\reala\Documents\code\h2p_device_view_temp\wafer_n_substrateetch
-
-folder_name: LORs
-path: C:\Users\reala\Documents\code\h2p_device_view_temp\LOR
-```
-
-`name` points to one folder of tiles. Plain names such as `mesaetch` are output as `Wafer_mesaetch`; names that already contain a `Wafer_` token are kept as written. The tile path may be outside the repository.
-
-`folder_name` points to a folder containing one direct child folder per wafer. The parent may contain only directories, and those child folders may contain files but no subfolders. Each wafer is named `{folder_name}_{child_folder}` (for example, `LORs_2-LOR`). Image extensions and image counts are not restricted.
-
-Blank lines and full-line comments beginning with `#` are ignored. Every other line must follow the declaration/path pairing above; if not, the parser reports the first bad physical line and stops before processing any wafers.
-
-## Manual alignment controls
-
-After pressing **START ALIGNMENT**:
-
-- Click the full-wafer image to set the coarse absolute left and right marker positions.
-- Drag inside a marker template to translate the full rectangle and square grid.
-- Drag a corner handle to scale the complete template uniformly.
-- Drag the circular handle to rotate the complete template around its center.
-- Use **RESET SYSTEM** to restore the automatic marker positions and geometry.
-
-## Defect-review controls
-
-| Control | Action |
-|---|---|
-| Left-drag | Draw a new rectangular defect region |
-| Lasso mode | Draw an irregular defect region |
-| Right-click a defect | Delete it |
-| `N`, Right Arrow, or Space | Next cell |
-| `P` or Left Arrow | Previous cell |
-| Up/Down Arrow | Jump to the cell above/below |
-| `C` | Clear all annotations on the current cell |
-| `X` | Toggle the current cell as excluded/damaged |
-| `Ctrl+Z` | Undo |
-| `Ctrl+Shift+Z` or `Ctrl+Y` | Redo |
-| `L` | Toggle annotation labels |
-| `K` | Copy the current view to the Windows clipboard |
-| `Q` or `Esc` | Save and quit |
-| `1`–`5` | Assign a class in standard typed mode only |
-
 ## Typical output for one wafer
 
 ```text
@@ -306,3 +208,13 @@ extracted_cells\
       ├─ Wafer_topcontact_reviewed_wafer_manual_mask.png
       └─ Wafer_topcontact_reviewed_wafer_report.json
 ```
+
+## Detection behavior
+
+The detector is recall-oriented. It is designed to find subtle particles, scratches, smears, holes, delamination, edge-clipped damage, and diffuse contamination while suppressing dense vertical device-line texture.
+
+Automatic detection uses an expanded device ROI for better border coverage. The full unzoomed crop remains the coordinate reference, and reviewed regions are mapped back into that coordinate system before GDS conversion.
+
+A human review step is still expected before GDS subtraction.
+
+Automatic proposals and manually added regions are preserved in the final reviewed JSON. The reviewed-wafer stitch distinguishes retained automatic detections from manually added detections.
