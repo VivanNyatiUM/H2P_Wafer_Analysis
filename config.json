@@ -1,7 +1,4 @@
 {
-  "gds_path": "future_design.gds",
-  "gds_layer": 0,
-  "gds_datatype": 0,
   "tile_cols": 40,
   "tile_rows": 58,
   "tile_width": 3000,
@@ -10,9 +7,5 @@
   "overlap_y_percent": 10.0,
   "output_image_size": 4000,
   "downscale_factor": 0.05,
-
-  "auto_alignment_translation_correction_um": {
-    "x": 0.0,
-    "y": 0.0
-  }
+  "gds_path": "semiconductor_design.gds"
 }

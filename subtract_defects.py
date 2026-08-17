@@ -1,3 +1,4 @@
+import design_geometry
 import os
 import re
 import json
@@ -11,8 +12,6 @@ import numpy as np
 import gdstk
 from h2p_progress import ProgressBar
 from batch_wafers_parser import parse_batch_file
-from wafer_run_layout import normalize_wafer_id, select_wafer_ids
-
 try:
     from remove_hanging_gridlines import (
         find_hanging_boundaries,
@@ -1248,7 +1247,7 @@ def _batch_defect_json_path(
     if not _is_none_value(configured):
         return Path(str(configured))
 
-    wafer_id = normalize_wafer_id(str(record["id"]))
+    wafer_id = str(record["id"]).strip()
     return Path(base_dir) / wafer_id / f"{wafer_id}_device_defects.json"
 
 
@@ -1347,6 +1346,63 @@ def _run_subtraction_job(
     )
 
 
+def _select_batch_records(
+    records: list[dict[str, str | None]],
+    wafer_selectors: list[str] | None = None,
+    folder_selectors: list[str] | None = None,
+) -> list[dict[str, str | None]]:
+    """Select batch records by wafer ID/name and/or folder_name group."""
+    requested_wafers = {
+        str(value).strip().casefold()
+        for value in (wafer_selectors or [])
+        if str(value).strip()
+    }
+    requested_folders = {
+        str(value).strip().casefold()
+        for value in (folder_selectors or [])
+        if str(value).strip()
+    }
+
+    if not requested_wafers and not requested_folders:
+        return list(records)
+
+    selected_records: list[dict[str, str | None]] = []
+    for record in records:
+        wafer_id = str(record["id"]).strip()
+        aliases = {wafer_id.casefold()}
+        if wafer_id.casefold().startswith("wafer_"):
+            aliases.add(wafer_id[6:].casefold())
+
+        source_group = str(record.get("source_group") or "").strip()
+        wafer_match = bool(requested_wafers & aliases)
+        folder_match = (
+            bool(source_group)
+            and source_group.casefold() in requested_folders
+        )
+        if wafer_match or folder_match:
+            selected_records.append(record)
+
+    if not selected_records:
+        available_wafers = ", ".join(str(record["id"]) for record in records)
+        available_folders = ", ".join(
+            sorted(
+                {
+                    str(record.get("source_group")).strip()
+                    for record in records
+                    if record.get("source_group")
+                },
+                key=str.casefold,
+            )
+        )
+        raise ValueError(
+            "No wafers matched the requested filter. "
+            f"Available wafers: {available_wafers or '(none)'}. "
+            f"Available folder_name groups: {available_folders or '(none)'}"
+        )
+
+    return selected_records
+
+
 def _parse_cli_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -1393,10 +1449,20 @@ def _parse_cli_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--folder",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help=(
+            "In batch mode, process every wafer expanded from this folder_name "
+            "group. Repeatable and may be combined with --wafer."
+        ),
+    )
+    parser.add_argument(
         "--gds",
         type=str,
-        default="future_design.gds",
-        help="Path to original GDS. Default: future_design.gds",
+        default=None,
+        help="Path to original GDS. Default: config.json gds_path",
     )
     parser.add_argument(
         "--out",
@@ -1560,8 +1626,8 @@ def _parse_cli_args() -> argparse.Namespace:
 
 
 def _run_single_mode(args: argparse.Namespace, json_path: str | Path) -> int:
-    if args.wafer:
-        raise ValueError("--wafer is only valid when using batch mode.")
+    if args.wafer or args.folder:
+        raise ValueError("--wafer and --folder are only valid when using batch mode.")
     output_path = Path(args.out) if args.out else _default_subtracted_output_path(json_path)
     print(f"[Runtime] version={SUBTRACT_DEFECTS_VERSION}")
     print("[Mode] Single-wafer mask creation")
@@ -1600,16 +1666,15 @@ def _run_single_mode(args: argparse.Namespace, json_path: str | Path) -> int:
 
 def _run_batch_mode(args: argparse.Namespace) -> int:
     records = parse_batch_file(args.batch)
-    wafer_ids = select_wafer_ids(records, args.wafer)
-    selected_keys = {wafer_id.casefold() for wafer_id in wafer_ids}
-    selected_records = [
-        record
-        for record in records
-        if normalize_wafer_id(str(record["id"])).casefold() in selected_keys
-    ]
 
-    if not selected_records:
-        raise ValueError("No wafers were selected from the batch file.")
+    selected_records = _select_batch_records(
+        records,
+        wafer_selectors=args.wafer,
+        folder_selectors=args.folder,
+    )
+
+    wafer_ids = [str(record["id"]) for record in selected_records]
+
     if len(selected_records) > 1 and args.out:
         raise ValueError("--out cannot represent multiple batch outputs; use --output-dir.")
     if len(selected_records) > 1 and args.report:
@@ -1638,7 +1703,7 @@ def _run_batch_mode(args: argparse.Namespace) -> int:
     batch_bar = ProgressBar("Batch masks", total)
     for index, record in enumerate(selected_records, start=1):
         attempted += 1
-        wafer_id = normalize_wafer_id(str(record["id"]))
+        wafer_id = str(record["id"]).strip()
         json_path = _batch_defect_json_path(record, base_dir=args.base)
         output_path = (
             Path(args.out)
@@ -1736,6 +1801,7 @@ def _run_batch_mode(args: argparse.Namespace) -> int:
 
 def main() -> int:
     args = _parse_cli_args()
+    args.gds = str(design_geometry.resolve_design_path(args.gds))
     if args.json_opt and args.json_path and Path(args.json_opt) != Path(args.json_path):
         raise ValueError("Provide either the positional JSON path or --json, not both.")
     json_path = args.json_opt or args.json_path

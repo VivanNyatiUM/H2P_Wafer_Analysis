@@ -15,6 +15,7 @@ import math
 import sys
 from dataclasses import replace
 from pathlib import Path
+import design_geometry
 from typing import Any, Optional
 
 import cv2
@@ -73,7 +74,7 @@ def _resolve_gds_path(argv: list[str], config_path: Path, explicit: str) -> Path
         path = Path(design_gds)
         return path if path.is_absolute() else Path.cwd() / path
 
-    preferred = Path.cwd() / "future_design.gds"
+    preferred = design_geometry.resolve_design_path()
     if preferred.exists():
         return preferred
 

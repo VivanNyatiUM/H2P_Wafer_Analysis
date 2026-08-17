@@ -605,6 +605,10 @@ class DeviceTile(tk.Frame):
 class FullImageViewer(tk.Toplevel):
     def __init__(self, parent: tk.Tk, entry: WaferDeviceEntry, overlay_opacity: float) -> None:
         super().__init__(parent)
+        # The repository-wide branding hook adds a floating badge to Toplevels.
+        # This viewer already has a dense control header, so keep only the native
+        # window icon and suppress the in-client badge for this popup.
+        self._h2p_embedded_branding = True
         self.entry = entry
         self.overlay_enabled = tk.BooleanVar(value=True)
         self.opacity = overlay_opacity
@@ -618,7 +622,7 @@ class FullImageViewer(tk.Toplevel):
             messagebox.showerror(APP_TITLE, f"Could not decode {entry.image_path}")
             return
 
-        self.title(f"{entry.wafer_id} Â· device {entry.device.label}")
+        self.title(f"{entry.wafer_id} · device {entry.device.label}")
         self.configure(bg=C.BG)
         screen_w = self.winfo_screenwidth()
         screen_h = self.winfo_screenheight()
@@ -629,7 +633,7 @@ class FullImageViewer(tk.Toplevel):
         header.pack(fill="x")
         tk.Label(
             header,
-            text=f"{entry.wafer_id}  Â·  Device {entry.device.label}",
+            text=f"{entry.wafer_id}  ·  Device {entry.device.label}",
             bg=C.SURFACE,
             fg=C.TEXT,
             font=_font(15, "bold"),
@@ -660,11 +664,11 @@ class FullImageViewer(tk.Toplevel):
         side.pack_propagate(False)
         tk.Label(side, text="IMAGE DETAILS", bg=C.SURFACE_2, fg=C.TEXT_3, font=_font(9, "bold")).pack(anchor="w")
         self._detail_row(side, "Filename", entry.image_path.name)
-        self._detail_row(side, "Resolution", f"{entry.image_size[0]} Ã— {entry.image_size[1]} px")
+        self._detail_row(side, "Resolution", f"{entry.image_size[0]} × {entry.image_size[1]} px")
         self._detail_row(side, "Annotations", entry.annotation_source.title())
         self._detail_row(side, "Defects", str(len(entry.defects)))
         if entry.gds_size_um:
-            self._detail_row(side, "GDS cell", f"{entry.gds_size_um[0]:.1f} Ã— {entry.gds_size_um[1]:.1f} Âµm")
+            self._detail_row(side, "GDS cell", f"{entry.gds_size_um[0]:.1f} × {entry.gds_size_um[1]:.1f} µm")
         tk.Frame(side, bg=C.BORDER_SOFT, height=1).pack(fill="x", pady=18)
         tk.Label(
             side,
@@ -776,6 +780,8 @@ class DeviceViewerApp:
         self._detail_content: tk.Frame | None = None
         self._detail_columns = 0
         self._render_job: str | None = None
+        self._data_health_popover: tk.Toplevel | None = None
+        self.data_health_chip: tk.Frame | None = None
         self.logo_path = logo_path
 
         root.title(APP_TITLE)
@@ -820,14 +826,21 @@ class DeviceViewerApp:
         brand.pack(side="left", fill="y")
         self._build_logo(brand)
         title_box = tk.Frame(brand, bg=C.SURFACE)
-        title_box.pack(side="left", padx=(14, 0), pady=3)
+        title_box.pack(side="left", padx=(14, 0), pady=14)
         tk.Label(title_box, text="H2P DEVICE INSPECTOR", bg=C.SURFACE, fg=C.TEXT, font=_font(17, "bold")).pack(anchor="w")
-        tk.Label(title_box, text="Cross-wafer defect intelligence", bg=C.SURFACE, fg=C.TEXT_3, font=_font(9)).pack(anchor="w", pady=(2, 0))
 
         right = tk.Frame(self.header, bg=C.SURFACE)
         right.pack(side="right", fill="y")
         self._header_chip(right, "ANNOTATIONS", self._annotation_mode_label(), C.BLUE, C.BLUE_DARK).pack(side="right", padx=(8, 0), pady=9)
-        self._header_chip(right, "DATA HEALTH", self._data_health_label(), C.GREEN if not self.catalog.warnings else C.ORANGE, C.GREEN_DARK if not self.catalog.warnings else C.ORANGE_DARK).pack(side="right", padx=(8, 0), pady=9)
+        self.data_health_chip = self._header_chip(
+            right,
+            "DATA HEALTH",
+            self._data_health_label(),
+            C.GREEN if not self.catalog.warnings else C.ORANGE,
+            C.GREEN_DARK if not self.catalog.warnings else C.ORANGE_DARK,
+            command=self._toggle_data_health_popover,
+        )
+        self.data_health_chip.pack(side="right", padx=(8, 0), pady=9)
 
         self.page = tk.Frame(self.root, bg=C.BG)
         self.page.pack(fill="both", expand=True)
@@ -856,13 +869,22 @@ class DeviceViewerApp:
         fallback = tk.Frame(holder, bg=C.WHITE)
         fallback.pack(expand=True)
         tk.Label(fallback, text="H2P", bg=C.WHITE, fg="#102743", font=_font(17, "bold")).pack()
-        tk.Label(fallback, text="HEAT â†’ POWER", bg=C.WHITE, fg="#52627A", font=_font(6, "bold")).pack()
+        tk.Label(fallback, text="HEAT → POWER", bg=C.WHITE, fg="#52627A", font=_font(6, "bold")).pack()
 
     @staticmethod
-    def _header_chip(master: tk.Misc, label: str, value: str, fg: str, bg: str) -> tk.Frame:
+    def _header_chip(
+        master: tk.Misc,
+        label: str,
+        value: str,
+        fg: str,
+        bg: str,
+        command: Callable[[], None] | None = None,
+    ) -> tk.Frame:
         frame = tk.Frame(master, bg=bg, padx=12, pady=9)
         tk.Label(frame, text=label, bg=bg, fg=fg, font=_font(7, "bold")).pack(anchor="w")
         tk.Label(frame, text=value, bg=bg, fg=C.TEXT, font=_font(9, "bold")).pack(anchor="w")
+        if command is not None:
+            _bind_click_recursive(frame, command)
         return frame
 
     def _annotation_mode_label(self) -> str:
@@ -876,7 +898,144 @@ class DeviceViewerApp:
         return "Mixed"
 
     def _data_health_label(self) -> str:
-        return "Ready" if not self.catalog.warnings else f"{len(self.catalog.warnings)} warnings"
+        if not self.catalog.warnings:
+            return "Ready  ▾"
+        count = len(self.catalog.warnings)
+        noun = "warning" if count == 1 else "warnings"
+        return f"{count} {noun}  ▾"
+
+    def _close_data_health_popover(self) -> None:
+        popup = self._data_health_popover
+        self._data_health_popover = None
+        if popup is None:
+            return
+        try:
+            if popup.winfo_exists():
+                popup.destroy()
+        except tk.TclError:
+            pass
+
+    def _toggle_data_health_popover(self) -> None:
+        popup = self._data_health_popover
+        if popup is not None:
+            try:
+                if popup.winfo_exists():
+                    self._close_data_health_popover()
+                    return
+            except tk.TclError:
+                self._data_health_popover = None
+
+        chip = self.data_health_chip
+        if chip is None:
+            return
+
+        popup = tk.Toplevel(self.root)
+        # This is a compact utility popover, not another branded app window.
+        popup._h2p_embedded_branding = True
+        popup.overrideredirect(True)
+        popup.configure(bg=C.BORDER)
+        popup.transient(self.root)
+        popup.bind("<Escape>", lambda _event: self._close_data_health_popover())
+        self._data_health_popover = popup
+
+        shell = tk.Frame(
+            popup,
+            bg=C.SURFACE_2,
+            highlightthickness=1,
+            highlightbackground=C.BORDER,
+            padx=16,
+            pady=14,
+        )
+        shell.pack(fill="both", expand=True)
+
+        heading = tk.Frame(shell, bg=C.SURFACE_2)
+        heading.pack(fill="x")
+        tk.Label(
+            heading,
+            text="DATA HEALTH",
+            bg=C.SURFACE_2,
+            fg=C.TEXT,
+            font=_font(12, "bold"),
+        ).pack(side="left")
+        close = tk.Label(
+            heading,
+            text="×",
+            bg=C.SURFACE_2,
+            fg=C.TEXT_2,
+            font=_font(13, "bold"),
+            cursor="hand2",
+            padx=4,
+        )
+        close.pack(side="right")
+        close.bind("<Button-1>", lambda _event: self._close_data_health_popover())
+
+        if self.catalog.warnings:
+            count = len(self.catalog.warnings)
+            noun = "warning" if count == 1 else "warnings"
+            summary = f"{count} {noun} detected while loading the current dataset."
+            summary_fg = C.ORANGE
+        else:
+            summary = "No dataset warnings were detected."
+            summary_fg = C.GREEN
+
+        tk.Label(
+            shell,
+            text=summary,
+            bg=C.SURFACE_2,
+            fg=summary_fg,
+            font=_font(9, "bold"),
+            justify="left",
+        ).pack(anchor="w", pady=(8, 10))
+
+        text_shell = tk.Frame(shell, bg=C.SURFACE_3)
+        text_shell.pack(fill="both", expand=True)
+        warning_text = tk.Text(
+            text_shell,
+            width=68,
+            height=max(3, min(11, len(self.catalog.warnings) * 2 or 3)),
+            wrap="word",
+            bg=C.SURFACE_3,
+            fg=C.TEXT_2,
+            insertbackground=C.TEXT,
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            padx=10,
+            pady=9,
+            font=_font(9),
+            cursor="arrow",
+        )
+        warning_scroll = ttk.Scrollbar(
+            text_shell,
+            orient="vertical",
+            command=warning_text.yview,
+        )
+        warning_text.configure(yscrollcommand=warning_scroll.set)
+        warning_text.pack(side="left", fill="both", expand=True)
+        warning_scroll.pack(side="right", fill="y")
+
+        if self.catalog.warnings:
+            for index, warning in enumerate(self.catalog.warnings, start=1):
+                if index > 1:
+                    warning_text.insert("end", "\n\n")
+                warning_text.insert("end", f"{index}. {warning}")
+        else:
+            warning_text.insert("end", "Dataset health is ready.")
+        warning_text.configure(state="disabled")
+
+        popup.update_idletasks()
+        width = max(460, min(620, popup.winfo_reqwidth()))
+        height = max(180, min(480, popup.winfo_reqheight()))
+        chip.update_idletasks()
+        x = chip.winfo_rootx() + chip.winfo_width() - width
+        y = chip.winfo_rooty() + chip.winfo_height() + 6
+        screen_w = popup.winfo_screenwidth()
+        screen_h = popup.winfo_screenheight()
+        x = max(8, min(x, screen_w - width - 8))
+        y = max(8, min(y, screen_h - height - 8))
+        popup.geometry(f"{width}x{height}+{x}+{y}")
+        popup.lift()
+        popup.focus_force()
 
     def _clear_page(self) -> None:
         self._photos.clear()
@@ -1246,10 +1405,10 @@ class DeviceViewerApp:
         w, h = entry.image_size
         gds = ""
         if entry.gds_size_um:
-            gds = f"  Â·  {entry.gds_size_um[0]:.0f}Ã—{entry.gds_size_um[1]:.0f} Âµm"
+            gds = f"  ·  {entry.gds_size_um[0]:.0f}×{entry.gds_size_um[1]:.0f} µm"
         tk.Label(
             meta,
-            text=f"{w}Ã—{h} px{gds}  Â·  {entry.annotation_source.title()}",
+            text=f"{w}×{h} px{gds}  ·  {entry.annotation_source.title()}",
             bg=C.CARD,
             fg=C.TEXT_3,
             font=_font(8),

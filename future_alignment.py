@@ -19,7 +19,7 @@ Dependencies:
 
 PowerShell example:
     python .\test_future_inner_alignment_markers.py `
-        --gds .\future_design.gds `
+        --gds ./your_design.gds `
         --wafer-image .\future_marker_candidate.png `
         --output-dir .\future_inner_marker_test_output
 """
@@ -48,7 +48,7 @@ except ImportError:  # Plot helpers are optional in production.
     MplPolygon = None
 
 
-# The actual future_design.gds row centers, normalized by the 400 um pitch.
+# The active design row centers, normalized by the 400 um pitch.
 # The central gap is deliberately about twice the ordinary row pitch because
 # the horizontal rail passes between the two middle rows.
 TEMPLATE_POINTS = np.asarray(
@@ -1861,7 +1861,7 @@ def _jsonable_dataclass(obj) -> dict:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--gds", type=Path, required=True, help="Path to future_design.gds")
+    parser.add_argument("--gds", type=Path, required=True, help="Path to GDS file")
     parser.add_argument(
         "--wafer-image",
         type=Path,

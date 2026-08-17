@@ -17,7 +17,6 @@ from batch_wafers_parser import parse_batch_file
 from wafer_run_layout import (
     count_analysis_images,
     detector_paths,
-    select_wafer_ids,
 )
 
 
@@ -65,6 +64,63 @@ def build_detector_command(
     return command
 
 
+def _select_batch_records(
+    records: list[dict[str, str | None]],
+    wafer_selectors: list[str] | None = None,
+    folder_selectors: list[str] | None = None,
+) -> list[dict[str, str | None]]:
+    """Select batch records by wafer ID/name and/or folder_name group."""
+    requested_wafers = {
+        str(value).strip().casefold()
+        for value in (wafer_selectors or [])
+        if str(value).strip()
+    }
+    requested_folders = {
+        str(value).strip().casefold()
+        for value in (folder_selectors or [])
+        if str(value).strip()
+    }
+
+    if not requested_wafers and not requested_folders:
+        return list(records)
+
+    selected_records: list[dict[str, str | None]] = []
+    for record in records:
+        wafer_id = str(record["id"]).strip()
+        aliases = {wafer_id.casefold()}
+        if wafer_id.casefold().startswith("wafer_"):
+            aliases.add(wafer_id[6:].casefold())
+
+        source_group = str(record.get("source_group") or "").strip()
+        wafer_match = bool(requested_wafers & aliases)
+        folder_match = (
+            bool(source_group)
+            and source_group.casefold() in requested_folders
+        )
+        if wafer_match or folder_match:
+            selected_records.append(record)
+
+    if not selected_records:
+        available_wafers = ", ".join(str(record["id"]) for record in records)
+        available_folders = ", ".join(
+            sorted(
+                {
+                    str(record.get("source_group")).strip()
+                    for record in records
+                    if record.get("source_group")
+                },
+                key=str.casefold,
+            )
+        )
+        raise ValueError(
+            "No wafers matched the requested filter. "
+            f"Available wafers: {available_wafers or '(none)'}. "
+            f"Available folder_name groups: {available_folders or '(none)'}"
+        )
+
+    return selected_records
+
+
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser(
         description="Detect and review each batch wafer independently."
@@ -73,6 +129,16 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--base", default="extracted_cells")
     parser.add_argument("--detector", default="defect_detector_analysis_roi.py")
     parser.add_argument("--wafer", action="append", default=[])
+    parser.add_argument(
+        "--folder",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help=(
+            "Process every wafer expanded from this folder_name group. "
+            "Repeatable and may be combined with --wafer."
+        ),
+    )
     parser.add_argument("--no-review", action="store_true")
     parser.add_argument("--quick-review", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -88,7 +154,14 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
 def main() -> int:
     args, extra_args = parse_args()
     records = parse_batch_file(args.batch)
-    wafer_ids = select_wafer_ids(records, args.wafer)
+
+    selected_records = _select_batch_records(
+        records,
+        wafer_selectors=args.wafer,
+        folder_selectors=args.folder,
+    )
+
+    wafer_ids = [str(record["id"]) for record in selected_records]
 
     detector_script = Path(args.detector).resolve()
     if not detector_script.exists():
