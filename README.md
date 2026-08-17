@@ -148,7 +148,6 @@ The main files are:
 
 26. config.json                             Geometry and stitching configuration
 27. batch_wafers.txt                        Wafer-name/path definitions
-28. future_design.gds                       Active future-design GDS
 29. semiconductor_design.gds                Legacy GDS used by the old workflow
 
 30. assets\h2pLogo.png                      H2P logo used by the UIs
@@ -159,7 +158,7 @@ Should be changed to semiconductor_design.gds if using the legacy pipeline.
 
 ```json
 {
-  "gds_path": "future_design.gds",
+  "gds_path": "semiconductor_design.gds",
   "gds_layer": 0,
   "gds_datatype": 0,
   "tile_cols": 40,
