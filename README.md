@@ -184,30 +184,6 @@ tile_x001_y002.jpg
 ...
 ```
 
-## Typical output for one wafer
-
-```text
-extracted_cells\
-└─ Wafer_topcontact\
-   ├─ analysis_png\
-   ├─ metadata\
-   ├─ seam_masks\
-   ├─ previews\
-   ├─ algo_previews\
-   ├─ normal_template_auto_roi_*.npz
-   ├─ algo_defects.json
-   ├─ Wafer_topcontact_device_defects.json
-   ├─ Wafer_topcontact_device_defects.json.review_state.json
-   └─ Wafer_topcontact_reviewed_wafer\
-      ├─ Wafer_topcontact_reviewed_wafer_clean.png
-      ├─ Wafer_topcontact_reviewed_wafer_defects.png
-      ├─ Wafer_topcontact_reviewed_wafer_outline.png
-      ├─ Wafer_topcontact_reviewed_wafer_defect_mask.png
-      ├─ Wafer_topcontact_reviewed_wafer_auto_mask.png
-      ├─ Wafer_topcontact_reviewed_wafer_manual_mask.png
-      └─ Wafer_topcontact_reviewed_wafer_report.json
-```
-
 ## Detection behavior
 
 The detector is recall-oriented. It is designed to find subtle particles, scratches, smears, holes, delamination, edge-clipped damage, and diffuse contamination while suppressing dense vertical device-line texture.
