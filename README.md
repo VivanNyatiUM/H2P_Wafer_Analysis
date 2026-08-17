@@ -92,7 +92,9 @@ python .\device_index_defect_viewer.py --summary
 python .\subtract_defects.py -l num1 num2 ...
 ```
 
-Subtracts the defects from the combined layers of num1, num2, etc.
+Subtracts the defects from the combined layers of num1, num2, etc, and produces a removal report.
+
+To opt out of the removal report, use `--no-report`. This saves quite a bit of time.
 
 Example:
 
