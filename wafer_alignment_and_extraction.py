@@ -21,7 +21,7 @@ import wafer_metrology
 import design_alignment
 import design_geometry
 from batch_wafers_parser import parse_batch_file
-WAFER_EXTRACTION_VERSION = 'future-design-only-refactor-v2-2026-08-10+targeted-extraction-v1+folder-selector-v1'
+WAFER_EXTRACTION_VERSION = 'future-design-only-refactor-v2-2026-08-10+targeted-extraction-v1+folder-selector-v1+marker-snap-v5'
 
 def load_config(path='config.json'):
     config_path = Path(path)
@@ -436,8 +436,9 @@ def process_wafer_cells(folder, json_file, config, args, wafer_id):
     scale_mult = 1.0
     try:
         canvas_xc, canvas_yc, canvas_R, flat_angle = wafer_metrology.detect_wafer_on_canvas(ds_canvas, ds_factor)
+        config_run['_wafer_flat_angle_rad'] = float(flat_angle)
         geometry = design_geometry.load_design_geometry(config_run['gds_path'])
-        alignment_runtime = {'ds_canvas': ds_canvas, 'tile_folder': str(folder), 'stitch_config_run': copy.deepcopy(config_run), 'ds_factor': float(ds_factor), 'canvas_center_full': (float(canvas_xc), float(canvas_yc)), 'canvas_radius_full': float(canvas_R), 'canvas_center_ds': (float(canvas_xc) * float(ds_factor), float(canvas_yc) * float(ds_factor)), 'canvas_radius_ds': float(canvas_R) * float(ds_factor)}
+        alignment_runtime = {'ds_canvas': ds_canvas, 'tile_folder': str(folder), 'wafer_id': str(out_stem), 'stitch_config_run': copy.deepcopy(config_run), 'ds_factor': float(ds_factor), 'canvas_center_full': (float(canvas_xc), float(canvas_yc)), 'canvas_radius_full': float(canvas_R), 'canvas_center_ds': (float(canvas_xc) * float(ds_factor), float(canvas_yc) * float(ds_factor)), 'canvas_radius_ds': float(canvas_R) * float(ds_factor), 'wafer_flat_angle_rad': float(flat_angle)}
         markers = gds_parser.parse_alignment_markers(config_run['gds_path'])
         if args.manual:
             print(f'\n[{out_stem}] Launching automated Centroid Snapping UI on tiles...')
@@ -617,13 +618,24 @@ def _parse_cell_selector(value: str) -> tuple[int, int]:
         raise argparse.ArgumentTypeError(f'invalid cell {value!r}; expected ROW-COL, for example 3-7')
     return (int(match.group(1)), int(match.group(2)))
 
+def _normalize_wafer_selector(value) -> str:
+    """Return the user-facing wafer name used by ``--wafer`` matching.
+
+    Named batch entries retain their historical ``Wafer_`` IDs for output paths
+    and metadata, but the CLI accepts the concise declared name as canonical.
+    The old prefixed spelling remains a backward-compatible alias.
+    """
+    normalized = str(value).strip().casefold()
+    return normalized[6:] if normalized.startswith('wafer_') else normalized
+
+
 def _select_batch_records(records: list[dict], wafer_selectors, folder_selectors) -> list[dict]:
     wafer_values = [str(value).strip() for value in wafer_selectors or [] if str(value).strip()]
     folder_values = [str(value).strip() for value in folder_selectors or [] if str(value).strip()]
     if not wafer_values and not folder_values:
         return list(records)
 
-    requested_wafers = {value.casefold() for value in wafer_values}
+    requested_wafers = {_normalize_wafer_selector(value) for value in wafer_values}
     requested_folders = {value.casefold() for value in folder_values}
     matched_wafers: set[str] = set()
     matched_folders: set[str] = set()
@@ -631,10 +643,8 @@ def _select_batch_records(records: list[dict], wafer_selectors, folder_selectors
 
     for record in records:
         wafer_id = str(record['id']).strip()
-        wafer_key = wafer_id.casefold()
+        wafer_key = _normalize_wafer_selector(wafer_id)
         aliases = {wafer_key}
-        if wafer_key.startswith('wafer_'):
-            aliases.add(wafer_id[6:].casefold())
 
         group = str(record.get('source_group') or '').strip()
         group_key = group.casefold() if group else ''
@@ -649,7 +659,7 @@ def _select_batch_records(records: list[dict], wafer_selectors, folder_selectors
     missing_wafers = sorted(requested_wafers - matched_wafers)
     missing_folders = sorted(requested_folders - matched_folders)
     if missing_wafers or missing_folders:
-        available_wafers = ', '.join(str(record['id']) for record in records)
+        available_wafers = ', '.join(_normalize_wafer_selector(record['id']) for record in records)
         available_groups = sorted(
             {str(record.get('source_group')).strip() for record in records if record.get('source_group')},
             key=str.casefold,
@@ -808,7 +818,7 @@ def main():
     parser.add_argument('--bound-opencv-threads', type=int, default=1, help='OpenCV worker threads while --bound is active. Default: 2')
     parser.add_argument('--bound-workers', type=int, default=3, help='Number of cells processed concurrently by --bound. Default: 3. Use 1 for minimum RAM or exact v4 execution order.')
     parser.add_argument('--bound-exact-jpeg-decode', action='store_true', help='Disable the faster reduced-DCT JPEG decode path. This reproduces v4 tile decoding at the cost of longer runtime.')
-    parser.add_argument('--wafer', action='append', default=[], metavar='NAME', help='Stage-1 wafer selector. Accepts a declared wafer name or canonical wafer ID. Repeat to select multiple.')
+    parser.add_argument('--wafer', action='append', default=[], metavar='NAME', help='Stage-1 wafer selector. Use the plain declared name, for example --wafer substrateetch. The legacy Wafer_ prefix is optional. Repeat to select multiple.')
     parser.add_argument('--folder', action='append', default=[], metavar='NAME', help='Stage-1 folder_name group selector. Repeat to select multiple folder groups.')
     parser.add_argument('--cell', action='append', default=[], type=_parse_cell_selector, metavar='ROW-COL', help='Create only this device cell, for example 3-7. Repeat --cell to select multiple device cells.')
     args = parser.parse_args()

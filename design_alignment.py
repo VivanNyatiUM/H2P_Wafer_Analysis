@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Callable
 import cv2
 import numpy as np
-ALIGNMENT_VERSION = 'design-direct-v19-panel-move-scale-rotate-compact-batch-2026-07-23'
+ALIGNMENT_VERSION = 'design-direct-v23-production-score-auto-refinement-2026-08-19'
 
 @dataclass(frozen=True)
 class DesignGeometry:
@@ -672,6 +672,233 @@ def _raw_fit_template(fit: dict[str, Any], candidate_sizes: list[float]) -> dict
     boxes['area', 0] = [(min(xs) - padding, min(ys) - padding), (max(xs) + padding, min(ys) - padding), (max(xs) + padding, max(ys) + padding), (min(xs) - padding, max(ys) + padding)]
     return {'boxes': boxes, 'squares': squares}
 
+def _raw_lattice_edge_map(image: np.ndarray) -> np.ndarray:
+    """Normalize weak and strong marker edges into one correlation image."""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    clahe = cv2.createCLAHE(clipLimit=3.5, tileGridSize=(12, 12)).apply(gray)
+    gx = cv2.Scharr(clahe, cv2.CV_32F, 1, 0)
+    gy = cv2.Scharr(clahe, cv2.CV_32F, 0, 1)
+    magnitude = cv2.magnitude(gx, gy)
+    scale = float(np.percentile(magnitude, 97.5))
+    if scale > 1e-06:
+        magnitude = np.clip(magnitude / scale, 0.0, 1.0)
+    return cv2.GaussianBlur(magnitude.astype(np.float32), (0, 0), 1.2)
+
+def _raw_lattice_edge_template(template: np.ndarray, pitch: float, square_size: float, angle_deg: float, side: str, include_rail: bool=True) -> tuple[np.ndarray, np.ndarray]:
+    """Render the 12-square lattice plus its directional GDS rail."""
+    centers = np.asarray(template, dtype=np.float32) * float(pitch)
+    half = 0.5 * float(square_size)
+    angle = math.radians(float(angle_deg))
+    rotation = np.asarray([[math.cos(angle), -math.sin(angle)], [math.sin(angle), math.cos(angle)]], dtype=np.float32)
+    corner_offsets = np.asarray([[-half, -half], [half, -half], [half, half], [-half, half]], dtype=np.float32)
+    rotated_boxes = [((center + corner_offsets) @ rotation.T) for center in centers]
+    rail_x0, rail_x1 = (-4.2, 1.3) if side == 'left' else (-1.3, 4.2)
+    rail = (np.asarray([[rail_x0, -0.25], [rail_x1, -0.25], [rail_x1, 0.25], [rail_x0, 0.25]], dtype=np.float32) * float(pitch)) @ rotation.T
+    all_points = np.vstack(rotated_boxes + ([rail] if include_rail else []))
+    margin = max(8, int(round(0.15 * pitch)))
+    minimum = np.floor(np.min(all_points, axis=0)).astype(np.int32) - margin
+    maximum = np.ceil(np.max(all_points, axis=0)).astype(np.int32) + margin
+    shape = (int(maximum[1] - minimum[1] + 1), int(maximum[0] - minimum[0] + 1))
+    rendered = np.zeros(shape, dtype=np.float32)
+    thickness = max(2, int(round(0.035 * pitch)))
+    for box in rotated_boxes:
+        cv2.polylines(rendered, [np.rint(box - minimum).astype(np.int32)], True, 1.0, thickness, cv2.LINE_AA)
+    if include_rail:
+        cv2.polylines(rendered, [np.rint(rail - minimum).astype(np.int32)], True, 0.65, thickness, cv2.LINE_AA)
+    rendered = cv2.GaussianBlur(rendered, (0, 0), max(1.0, 0.015 * pitch))
+    return rendered, -minimum.astype(np.float32)
+
+def _stitch_raw_marker_neighborhood(indexed: dict[tuple[int, int], Path], approximate_anchor_raw: tuple[float, float], expected_pitch_raw: float, raw_size: tuple[int, int], config: dict[str, Any], work_factor: float=0.25) -> tuple[np.ndarray, tuple[int, int]]:
+    """Build a small downsampled raw-tile mosaic around one predicted marker."""
+    from illumination_stitching import make_feather_weight
+
+    raw_w, raw_h = raw_size
+    configured_w = int(config.get('tile_width', raw_w) or raw_w)
+    configured_h = int(config.get('tile_height', raw_h) or raw_h)
+    step_x = configured_w * (1.0 - float(config.get('overlap_x_percent', 0.0) or 0.0) / 100.0)
+    step_y = configured_h * (1.0 - float(config.get('overlap_y_percent', 0.0) or 0.0) / 100.0)
+    # Marker scale can differ a few percent from radius metrology.  At the wafer
+    # edge that becomes a several-pitch position error, so retain enough context
+    # to contain the physical marker rather than clipping it at the prior.
+    half_size = max(1600, int(math.ceil(12.0 * expected_pitch_raw)))
+    x0 = int(round(float(approximate_anchor_raw[0]) - half_size))
+    y0 = int(round(float(approximate_anchor_raw[1]) - half_size))
+    x1 = x0 + 2 * half_size
+    y1 = y0 + 2 * half_size
+    local_w = max(8, int(round((x1 - x0) * work_factor)))
+    local_h = max(8, int(round((y1 - y0) * work_factor)))
+    tile_w_work = max(1, int(round(configured_w * work_factor)))
+    tile_h_work = max(1, int(round(configured_h * work_factor)))
+    overlap_x_work = max(1, int(round(configured_w * float(config.get('overlap_x_percent', 0.0) or 0.0) * 0.01 * work_factor)))
+    overlap_y_work = max(1, int(round(configured_h * float(config.get('overlap_y_percent', 0.0) or 0.0) * 0.01 * work_factor)))
+    acc = np.zeros((local_h, local_w, 3), dtype=np.float32)
+    weight_sum = np.zeros((local_h, local_w), dtype=np.float32)
+
+    for key, path in indexed.items():
+        col, row = key
+        tile_x0 = max(0, int((col - 1) * step_x))
+        tile_y0 = max(0, int((row - 1) * step_y))
+        tile_x1 = tile_x0 + configured_w
+        tile_y1 = tile_y0 + configured_h
+        if tile_x1 <= x0 or tile_x0 >= x1 or tile_y1 <= y0 or tile_y0 >= y1:
+            continue
+        raw = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if raw is None:
+            continue
+        if raw.shape[1] != configured_w or raw.shape[0] != configured_h:
+            raw = cv2.resize(raw, (configured_w, configured_h), interpolation=cv2.INTER_AREA)
+        tile_work = cv2.resize(raw, (tile_w_work, tile_h_work), interpolation=cv2.INTER_AREA)
+        weight = make_feather_weight(tile_h_work, tile_w_work, overlap_x_work, overlap_y_work, has_left=(col - 1, row) in indexed, has_right=(col + 1, row) in indexed, has_top=(col, row - 1) in indexed, has_bottom=(col, row + 1) in indexed)
+        destination_x0 = int(round((tile_x0 - x0) * work_factor))
+        destination_y0 = int(round((tile_y0 - y0) * work_factor))
+        destination_x1 = destination_x0 + tile_w_work
+        destination_y1 = destination_y0 + tile_h_work
+        ox0 = max(0, destination_x0)
+        oy0 = max(0, destination_y0)
+        ox1 = min(local_w, destination_x1)
+        oy1 = min(local_h, destination_y1)
+        if ox1 <= ox0 or oy1 <= oy0:
+            continue
+        sx0 = ox0 - destination_x0
+        sy0 = oy0 - destination_y0
+        sx1 = sx0 + (ox1 - ox0)
+        sy1 = sy0 + (oy1 - oy0)
+        tile_crop = tile_work[sy0:sy1, sx0:sx1]
+        weight_crop = weight[sy0:sy1, sx0:sx1]
+        acc[oy0:oy1, ox0:ox1] += tile_crop.astype(np.float32) * weight_crop[:, :, None]
+        weight_sum[oy0:oy1, ox0:ox1] += weight_crop
+
+    if not np.any(weight_sum > 1e-06):
+        raise RuntimeError('No raw tiles overlap the predicted marker neighborhood')
+    mosaic = np.zeros_like(acc, dtype=np.uint8)
+    valid = weight_sum > 1e-06
+    mosaic[valid] = np.clip(acc[valid] / weight_sum[valid, None], 0.0, 255.0).astype(np.uint8)
+    return mosaic, (x0, y0)
+
+def _match_raw_lattice_edge_template(image: np.ndarray, template: np.ndarray, expected_pitch_work: float, expected_anchor_work: tuple[float, float], expected_angle_deg: float, side: str, include_rail: bool=True) -> dict[str, Any]:
+    """Find a whole marker by correlating all 12 expected square borders."""
+    edges = _raw_lattice_edge_map(image)
+    best: dict[str, Any] | None = None
+    hypotheses: list[dict[str, Any]] = []
+    coarse_scales = np.linspace(0.92, 1.08, 5)
+    coarse_angles = float(expected_angle_deg) + np.linspace(-4.0, 4.0, 5)
+
+    def evaluate(scale_factor: float, angle_deg: float) -> None:
+        nonlocal best
+        pitch = float(expected_pitch_work) * float(scale_factor)
+        square_size = 0.5 * pitch
+        rendered, anchor_in_template = _raw_lattice_edge_template(template, pitch, square_size, angle_deg, side, include_rail=include_rail)
+        if rendered.shape[0] >= edges.shape[0] or rendered.shape[1] >= edges.shape[1]:
+            return
+        response = cv2.matchTemplate(edges, rendered, cv2.TM_CCORR_NORMED)
+        yy, xx = np.indices(response.shape, dtype=np.float32)
+        distance_squared = (xx + float(anchor_in_template[0]) - float(expected_anchor_work[0])) ** 2 + (yy + float(anchor_in_template[1]) - float(expected_anchor_work[1])) ** 2
+        objective = response - 0.0003 * distance_squared / max(float(expected_pitch_work) ** 2, 1e-09)
+        objective_peaks = objective.copy()
+        suppression_radius = max(3, int(round(0.8 * expected_pitch_work)))
+        for _peak_index in range(3):
+            _minimum, objective_score, _min_location, location = cv2.minMaxLoc(objective_peaks)
+            score = float(response[location[1], location[0]])
+            candidate = {'score': score, 'objective_score': float(objective_score), 'location': location, 'anchor_work': (float(location[0] + anchor_in_template[0]), float(location[1] + anchor_in_template[1])), 'pitch_work': pitch, 'square_work': square_size, 'angle_deg': float(angle_deg)}
+            hypotheses.append(candidate)
+            if best is None or float(objective_score) > float(best['objective_score']):
+                best = candidate
+            cv2.circle(objective_peaks, location, suppression_radius, -1.0e6, -1)
+
+    for scale_factor in coarse_scales:
+        for angle_deg in coarse_angles:
+            evaluate(float(scale_factor), float(angle_deg))
+    if best is None:
+        raise RuntimeError('No valid full-lattice edge-correlation template')
+    base_scale = float(best['pitch_work']) / max(float(expected_pitch_work), 1e-09)
+    base_angle = float(best['angle_deg'])
+    for scale_factor in np.linspace(base_scale - 0.02, base_scale + 0.02, 3):
+        for angle_deg in np.linspace(base_angle - 1.0, base_angle + 1.0, 3):
+            evaluate(float(scale_factor), float(angle_deg))
+    assert best is not None
+    distinct: list[dict[str, Any]] = []
+    for candidate in sorted(hypotheses, key=lambda item: float(item['objective_score']), reverse=True):
+        if all(float(np.linalg.norm(np.asarray(candidate['anchor_work']) - np.asarray(kept['anchor_work']))) >= 0.45 * expected_pitch_work or abs(float(candidate['pitch_work']) - float(kept['pitch_work'])) >= 0.025 * expected_pitch_work for kept in distinct):
+            distinct.append(candidate)
+        if len(distinct) >= 24:
+            break
+    best = dict(best)
+    best['alternatives'] = [dict(candidate) for candidate in distinct if abs(float(candidate['objective_score']) - float(best['objective_score'])) > 1e-12 or float(np.linalg.norm(np.asarray(candidate['anchor_work']) - np.asarray(best['anchor_work']))) > 1e-06][:23]
+    return best
+
+def _run_raw_tile_edge_template_detector(indexed: dict[tuple[int, int], Path], predicted: dict[str, tuple[float, float]], expected_pitch_ds: float, exact_ds: float, raw_size: tuple[int, int], geometry: DesignGeometry, config: dict[str, Any], *, include_rail: bool=True, fixed_matches: dict[str, dict[str, Any]] | None=None) -> dict[str, dict[str, Any]]:
+    """Fallback for faint, damaged, or partially merged optical markers."""
+    work_factor = 0.20
+    stitch_factor = 0.20
+    expected_pitch_raw = float(expected_pitch_ds) / max(float(exact_ds), 1e-09)
+    expected_angle_deg = math.degrees(float(config.get('_wafer_flat_angle_rad', 0.0) or 0.0))
+    template = _raw_template_for_side(geometry, 'left')
+    side_options: dict[str, list[dict[str, Any]]] = {}
+    for side in ('left', 'right'):
+        if fixed_matches and side in fixed_matches:
+            fixed = copy.deepcopy(fixed_matches[side])
+            diagnostics = fixed['diagnostics']
+            diagnostics.setdefault('template_correlation', float(np.clip(0.45 + 0.03 * float(diagnostics.get('match_count', 0)) - float(diagnostics.get('error_pitch_ratio', 0.0) or 0.0), 0.0, 0.85)))
+            diagnostics.setdefault('template_objective', diagnostics['template_correlation'])
+            side_options[side] = [fixed]
+            continue
+        predicted_raw = (float(predicted[side][0]) / exact_ds, float(predicted[side][1]) / exact_ds)
+        mosaic, origin_raw = _stitch_raw_marker_neighborhood(indexed, predicted_raw, expected_pitch_raw, raw_size, config, work_factor=stitch_factor)
+        if stitch_factor != work_factor:
+            resize_factor = work_factor / stitch_factor
+            mosaic = cv2.resize(mosaic, None, fx=resize_factor, fy=resize_factor, interpolation=cv2.INTER_AREA)
+        expected_anchor_work = ((predicted_raw[0] - float(origin_raw[0])) * work_factor, (predicted_raw[1] - float(origin_raw[1])) * work_factor)
+        match = _match_raw_lattice_edge_template(mosaic, template, expected_pitch_raw * work_factor, expected_anchor_work, expected_angle_deg, side, include_rail=include_rail)
+        template_mode = '12-square + directional-rail edge correlation' if include_rail else '12-square edge correlation'
+        options: list[dict[str, Any]] = []
+        for hypothesis in [match] + list(match.get('alternatives', [])):
+            anchor_raw = (float(origin_raw[0]) + float(hypothesis['anchor_work'][0]) / work_factor, float(origin_raw[1]) + float(hypothesis['anchor_work'][1]) / work_factor)
+            anchor_ds = np.asarray([anchor_raw[0] * exact_ds, anchor_raw[1] * exact_ds], dtype=np.float64)
+            pitch_ds = float(hypothesis['pitch_work']) / work_factor * exact_ds
+            square_ds = float(hypothesis['square_work']) / work_factor * exact_ds
+            angle = math.radians(float(hypothesis['angle_deg']))
+            rotation = np.asarray([[math.cos(angle), -math.sin(angle)], [math.sin(angle), math.cos(angle)]], dtype=np.float64)
+            predicted_squares = pitch_ds * (rotation @ template.T).T + anchor_ds
+            fit = {'predicted': predicted_squares, 'pitch': pitch_ds, 'transform': pitch_ds * rotation, 'anchor': anchor_ds}
+            options.append({'anchor': (float(anchor_ds[0]), float(anchor_ds[1])), 'template': _raw_fit_template(fit, [square_ds] * len(template)), 'diagnostics': {'source': 'raw-tile full-marker edge template', 'optical_mode': 'edge-template', 'fit_mode': template_mode, 'algorithm_detail': f'CLAHE + Scharr edge map correlated against exact GDS {template_mode}', 'match_count': 12, 'pitch_ds_px': pitch_ds, 'mean_error_ds_px': None, 'rms_error_ds_px': None, 'error_pitch_ratio': None, 'template_correlation': float(hypothesis['score']), 'template_objective': float(hypothesis['objective_score']), 'angle_deg': float(hypothesis['angle_deg']), 'candidate_count': 0, 'legacy_candidate_count': 0, 'unified_candidate_count': 0, 'canvas_translation_refinement': {'applied': False, 'shift_ds_px': [0.0, 0.0], 'mode': 'full-marker template fitted in nominal raw-tile coordinates'}, 'tiles': []}})
+        side_options[side] = options
+
+    predicted_left = np.asarray(predicted['left'], dtype=np.float64)
+    predicted_right = np.asarray(predicted['right'], dtype=np.float64)
+    expected_separation = float(np.linalg.norm(predicted_right - predicted_left))
+    pair_candidates: list[tuple[float, dict[str, Any], dict[str, Any], dict[str, Any]]] = []
+    for left_option in side_options['left']:
+        for right_option in side_options['right']:
+            left = np.asarray(left_option['anchor'], dtype=np.float64)
+            right = np.asarray(right_option['anchor'], dtype=np.float64)
+            separation_ratio = float(np.linalg.norm(right - left)) / max(expected_separation, 1e-09)
+            midpoint_error = float(np.linalg.norm(0.5 * (left + right) - 0.5 * (predicted_left + predicted_right)))
+            scores = [float(left_option['diagnostics']['template_correlation']), float(right_option['diagnostics']['template_correlation'])]
+            angles = [float(left_option['diagnostics']['angle_deg']), float(right_option['diagnostics']['angle_deg'])]
+            pitches = [float(left_option['diagnostics']['pitch_ds_px']), float(right_option['diagnostics']['pitch_ds_px'])]
+            baseline_angle = math.degrees(math.atan2(float(right[1] - left[1]), float(right[0] - left[0])))
+            doubled_x = math.cos(math.radians(2.0 * angles[0])) + math.cos(math.radians(2.0 * angles[1]))
+            doubled_y = math.sin(math.radians(2.0 * angles[0])) + math.sin(math.radians(2.0 * angles[1]))
+            mean_marker_angle = 0.5 * math.degrees(math.atan2(doubled_y, doubled_x))
+            baseline_angle_error = abs(((baseline_angle - mean_marker_angle + 90.0) % 180.0) - 90.0)
+            angle_difference = abs(((angles[0] - angles[1] + 90.0) % 180.0) - 90.0)
+            pitch_ratio_error = abs(pitches[0] / max(pitches[1], 1e-09) - 1.0)
+            pair_ok = 0.985 <= separation_ratio <= 1.026 and midpoint_error <= 3.5 * expected_pitch_ds and min(scores) >= 0.30 and max(scores) >= 0.35 and angle_difference <= 1.25 and pitch_ratio_error <= 0.12 and baseline_angle_error <= 0.75
+            pair_diagnostics = {'separation_ratio': separation_ratio, 'midpoint_error_ds_px': midpoint_error, 'minimum_correlation': min(scores), 'maximum_correlation': max(scores), 'angles_deg': angles, 'angle_difference_deg': angle_difference, 'baseline_angle_deg': baseline_angle, 'baseline_angle_error_deg': baseline_angle_error, 'pitches_ds_px': pitches, 'anchors_ds_px': {'left': [float(left[0]), float(left[1])], 'right': [float(right[0]), float(right[1])]}, 'accepted': bool(pair_ok)}
+            quality = sum(scores) - 0.08 * baseline_angle_error - 0.45 * pitch_ratio_error - 0.004 * midpoint_error / max(expected_pitch_ds, 1e-09) - 0.25 * abs(separation_ratio - 1.0)
+            if pair_ok:
+                pair_candidates.append((quality, left_option, right_option, pair_diagnostics))
+    if not pair_candidates:
+        primary_left = side_options['left'][0]
+        primary_right = side_options['right'][0]
+        raise RuntimeError(f'Full-lattice edge-template pair failed joint validation; primary anchors={primary_left["anchor"]}, {primary_right["anchor"]}')
+    _quality, left_match, right_match, pair_diagnostics = max(pair_candidates, key=lambda item: item[0])
+    matches = {'left': left_match, 'right': right_match}
+    for side in ('left', 'right'):
+        matches[side]['diagnostics']['pair_validation'] = pair_diagnostics
+        matches[side]['diagnostics']['joint_hypotheses_evaluated'] = len(side_options['left']) * len(side_options['right'])
+    return matches
+
 def _run_raw_tile_lattice_detector(tile_folder: str | Path, ds_canvas: np.ndarray, canvas_center_ds: tuple[float, float], canvas_radius_ds: float, geometry: DesignGeometry, ds_factor: float, stitch_config: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """Detect both optical marker styles without changing v13 coordinates.
 
@@ -719,7 +946,7 @@ def _run_raw_tile_lattice_detector(tile_folder: str | Path, ds_canvas: np.ndarra
     nominal_origins = {key: (float(max(0, int((key[0] - 1) * step_x_raw * exact_ds))), float(max(0, int((key[1] - 1) * step_y_raw * exact_ds)))) for key in indexed if 1 <= key[0] <= cols and 1 <= key[1] <= rows}
     if len(nominal_origins) < 4:
         raise RuntimeError('Too few valid 1-based tiles for exact production mapping')
-    predicted = _predict_marker_pixels(canvas_center_ds, canvas_radius_ds, geometry)
+    predicted = _predict_marker_pixels(canvas_center_ds, canvas_radius_ds, geometry, angle_rad=float(config.get('_wafer_flat_angle_rad', 0.0) or 0.0))
     expected_pitch_ds = 400.0 * float(canvas_radius_ds) / max(geometry.radius, 1e-09)
     expected_square_ds = 0.5 * expected_pitch_ds
     expected_square_raw = expected_square_ds / max(0.5 * (scale_x + scale_y), 1e-09)
@@ -739,6 +966,7 @@ def _run_raw_tile_lattice_detector(tile_folder: str | Path, ds_canvas: np.ndarra
         ratio = float(fit.get('mean_error', float('inf'))) / max(float(fit.get('pitch', 0.0)), 1e-09)
         return match_count >= minimum_matches and ratio <= maximum_ratio
     output: dict[str, dict[str, Any]] = {}
+    fit_failures: dict[str, str] = {}
     for side in ('left', 'right'):
         marker_prediction = np.asarray(predicted[side], dtype=np.float64)
         ranked_tiles: list[tuple[float, tuple[int, int], Path]] = []
@@ -793,7 +1021,8 @@ def _run_raw_tile_lattice_detector(tile_folder: str | Path, ds_canvas: np.ndarra
         else:
             legacy_summary = None if legacy_fit is None else {'matches': len(legacy_fit.get('matches', [])), 'mean_error': float(legacy_fit.get('mean_error', float('nan'))), 'pitch': float(legacy_fit.get('pitch', float('nan')))}
             unified_summary = None if unified_fit is None else {'matches': len(unified_fit.get('matches', [])), 'mean_error': float(unified_fit.get('mean_error', float('nan'))), 'pitch': float(unified_fit.get('pitch', float('nan')))}
-            raise RuntimeError(f'Raw tile detector could not validate the {side} marker; optical_mode={optical_mode}, filled_candidates={filled_count}, legacy={legacy_summary}, unified={unified_summary}')
+            fit_failures[side] = f'optical_mode={optical_mode}, filled_candidates={filled_count}, legacy={legacy_summary}, unified={unified_summary}'
+            continue
         assert fit is not None
         match_count = len(fit['matches'])
         error_ratio = float(fit['mean_error']) / max(float(fit['pitch']), 1e-09)
@@ -806,7 +1035,30 @@ def _run_raw_tile_lattice_detector(tile_folder: str | Path, ds_canvas: np.ndarra
                     matched_sizes.append(float(chosen_candidates[candidate_index]['size']))
         if not matched_sizes:
             matched_sizes = [0.5 * float(fit['pitch'])]
-        output[side] = {'anchor': (float(fit['anchor'][0]), float(fit['anchor'][1])), 'template': _raw_fit_template(fit, matched_sizes), 'diagnostics': {'source': 'original-resolution tile lattice', 'optical_mode': optical_mode, 'fit_mode': fit_mode, 'algorithm_detail': str(fit.get('fit_mode', fit_mode)), 'filled_candidate_count': int(filled_count), 'match_count': int(match_count), 'pitch_ds_px': float(fit['pitch']), 'mean_error_ds_px': float(fit['mean_error']), 'rms_error_ds_px': float(fit.get('rms_error', fit['mean_error'])), 'error_pitch_ratio': error_ratio, 'candidate_count': len(chosen_candidates), 'legacy_candidate_count': len(legacy_candidates), 'unified_candidate_count': len(unified_candidates), 'canvas_translation_refinement': {'applied': False, 'shift_ds_px': [0.0, 0.0], 'mode': 'disabled; preserve empirically correct v13 coordinate map'}, 'tiles': tile_diagnostics}}
+        fit_angle_deg = ((math.degrees(math.atan2(float(np.asarray(fit['transform'])[1, 0]), float(np.asarray(fit['transform'])[0, 0]))) + 90.0) % 180.0) - 90.0
+        output[side] = {'anchor': (float(fit['anchor'][0]), float(fit['anchor'][1])), 'template': _raw_fit_template(fit, matched_sizes), 'diagnostics': {'source': 'original-resolution tile lattice', 'optical_mode': optical_mode, 'fit_mode': fit_mode, 'algorithm_detail': str(fit.get('fit_mode', fit_mode)), 'filled_candidate_count': int(filled_count), 'match_count': int(match_count), 'pitch_ds_px': float(fit['pitch']), 'mean_error_ds_px': float(fit['mean_error']), 'rms_error_ds_px': float(fit.get('rms_error', fit['mean_error'])), 'error_pitch_ratio': error_ratio, 'angle_deg': fit_angle_deg, 'candidate_count': len(chosen_candidates), 'legacy_candidate_count': len(legacy_candidates), 'unified_candidate_count': len(unified_candidates), 'canvas_translation_refinement': {'applied': False, 'shift_ds_px': [0.0, 0.0], 'mode': 'disabled; preserve empirically correct v13 coordinate map'}, 'tiles': tile_diagnostics}}
+    if fit_failures:
+        fixed_matches = dict(output)
+        try:
+            # The repeated process rails near the LOR left marker can resemble the
+            # optional directional rail more strongly than the marker itself.  On
+            # LOR3 that moved the otherwise correct 12-square solution two columns
+            # right.  Make the complete square lattice authoritative and consult
+            # the rail only if the square-only left/right pair cannot validate.
+            try:
+                output = _run_raw_tile_edge_template_detector(indexed, predicted, expected_pitch_ds, exact_ds, (raw_w, raw_h), geometry, config, include_rail=False, fixed_matches=fixed_matches)
+            except Exception as square_exc:
+                try:
+                    output = _run_raw_tile_edge_template_detector(indexed, predicted, expected_pitch_ds, exact_ds, (raw_w, raw_h), geometry, config, include_rail=True, fixed_matches=fixed_matches)
+                    for side in ('left', 'right'):
+                        output[side]['diagnostics']['square_template_failure'] = str(square_exc)
+                except Exception as rail_exc:
+                    raise RuntimeError(f'square-only template failed ({square_exc}); rail-aware template failed ({rail_exc})') from rail_exc
+            for side in ('left', 'right'):
+                output[side]['diagnostics']['candidate_lattice_failures'] = dict(fit_failures)
+        except Exception as exc:
+            summaries = '; '.join((f'{side}: {reason}' for side, reason in fit_failures.items()))
+            raise RuntimeError(f'Raw tile candidate lattice failed ({summaries}); edge-template fallback failed ({exc})') from exc
     debug_dir = Path('future_alignment_debug')
     debug_dir.mkdir(exist_ok=True)
     debug_report = {'adapter_version': ALIGNMENT_VERSION, 'tile_folder': str(tile_folder), 'ds_canvas_size': [int(ds_canvas.shape[1]), int(ds_canvas.shape[0])], 'ds_factor': float(exact_ds), 'mapping_mode': 'v13 exact production index/overlap map; no canvas nudge', 'configured_tile_size': [int(configured_w), int(configured_h)], 'downscaled_tile_size': [int(tile_w_ds), int(tile_h_ds)], 'raw_step_px': [float(step_x_raw), float(step_y_raw)], 'canvas_center_ds': [float(canvas_center_ds[0]), float(canvas_center_ds[1])], 'canvas_radius_ds': float(canvas_radius_ds), 'markers': {side: {'anchor_ds_px': [float(output[side]['anchor'][0]), float(output[side]['anchor'][1])], **output[side]['diagnostics']} for side in ('left', 'right')}}
@@ -831,6 +1083,68 @@ def _run_raw_tile_lattice_detector(tile_folder: str | Path, ds_canvas: np.ndarra
                 cv2.drawMarker(crop, (int(round(anchor[0] - x0)), int(round(anchor[1] - y0))), (0, 0, 255), cv2.MARKER_CROSS, 18, 2, cv2.LINE_AA)
                 cv2.imwrite(str(debug_dir / f'raw_tile_{side}_latest.png'), crop)
     return output
+
+def _refine_raw_details_with_production_snap(ds_canvas: np.ndarray, raw_details: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Use the production UI score to correct a strong full-marker AUTO mismatch.
+
+    Raw edge correlation is useful for generating hypotheses, but process rails can
+    give a partial grid a plausible score.  The production snap scorer has a much
+    cleaner separation on these wafers (roughly 0.6 for the decoy versus 0.9+ for
+    the complete marker), so it is the final AUTO acceptance gate as well.
+    """
+    from alignment_review import find_local_template_snap
+
+    def transform(points: list[tuple[float, float]], center: tuple[float, float], result: dict[str, Any]) -> list[tuple[float, float]]:
+        theta = math.radians(float(result['angle_deg']))
+        cosine, sine = math.cos(theta), math.sin(theta)
+        scale = float(result['scale'])
+        dx, dy = float(result['dx']), float(result['dy'])
+        cx, cy = float(center[0]), float(center[1])
+        transformed: list[tuple[float, float]] = []
+        for x, y in points:
+            rx, ry = (float(x) - cx) * scale, (float(y) - cy) * scale
+            transformed.append((cx + cosine * rx - sine * ry + dx, cy + sine * rx + cosine * ry + dy))
+        return transformed
+
+    for side in ('left', 'right'):
+        detail = raw_details.get(side)
+        if not detail:
+            continue
+        template = detail.get('template', {}) or {}
+        boxes = template.get('boxes', {}) or {}
+        squares = template.get('squares', {}) or {}
+        anchor = tuple(detail.get('anchor', ()))
+        if len(anchor) != 2:
+            continue
+        result = find_local_template_snap(ds_canvas, boxes, squares, anchor)
+        score = float(result.get('score', 0.0) or 0.0)
+        baseline = float(result.get('baseline_score', 0.0) or 0.0)
+        improvement = float(result.get('improvement', score - baseline) or 0.0)
+        # Correct LOR poses score 0.9+ even when mildly damaged. Requiring both
+        # high absolute confidence and a large gain prevents a perfect right-side
+        # result from being changed for a negligible numerical improvement.
+        applied = bool(result.get('ok')) and score >= 0.88 and improvement >= 0.10
+        refinement = {
+            'applied': applied,
+            'score': score,
+            'baseline_score': baseline,
+            'improvement': improvement,
+            'move_ds_px': [float(result.get('dx', 0.0) or 0.0), float(result.get('dy', 0.0) or 0.0)],
+            'scale': float(result.get('scale', 1.0) or 1.0),
+            'angle_deg': float(result.get('angle_deg', 0.0) or 0.0),
+            'acceptance': 'score >= 0.88 and improvement >= 0.10',
+        }
+        detail.setdefault('diagnostics', {})['production_snap_refinement'] = refinement
+        if not applied:
+            continue
+        detail['template'] = {
+            'boxes': {key: transform(corners, anchor, result) for key, corners in boxes.items()},
+            'squares': {key: transform([point], anchor, result)[0] for key, point in squares.items()},
+        }
+        detail['anchor'] = (float(anchor[0]) + float(result['dx']), float(anchor[1]) + float(result['dy']))
+        detail['diagnostics']['source'] = f"{detail['diagnostics'].get('source', 'raw detector')} + production-score AUTO refinement"
+        detail['diagnostics']['fit_mode'] = f"{detail['diagnostics'].get('fit_mode', 'raw fit')} + high-confidence full-template snap"
+    return raw_details
 
 def _similarity_from_two_points(physical_gds_frame: dict[str, tuple[float, float]], nominal: dict[str, tuple[float, float]]) -> tuple[float, float, float, float]:
     p_left = np.asarray(physical_gds_frame['left'], dtype=np.float64)
@@ -887,11 +1201,20 @@ def _estimate_review_wafer(image_bgr: np.ndarray) -> tuple[tuple[float, float], 
         return (center, radius)
     return (((w - 1) * 0.5, (h - 1) * 0.5), 0.48 * min(w, h))
 
-def _predict_marker_pixels(center_px: tuple[float, float], radius_px: float, geometry: DesignGeometry) -> dict[str, tuple[float, float]]:
-    result: dict[str, tuple[float, float]] = {}
+def _project_gds_point_to_pixels(point_gds: tuple[float, float] | np.ndarray, center_px: tuple[float, float], radius_px: float, geometry: DesignGeometry, angle_rad: float=0.0) -> tuple[float, float]:
+    """Project one GDS point into the shared stitched-image coordinate frame."""
     scale = float(radius_px) / max(geometry.radius, 1e-09)
+    cosine = math.cos(float(angle_rad))
+    sine = math.sin(float(angle_rad))
+    gx, gy = float(point_gds[0]), float(point_gds[1])
+    dx = (gx - geometry.center[0]) * scale
+    dy = -(gy - geometry.center[1]) * scale
+    return (float(center_px[0] + cosine * dx - sine * dy), float(center_px[1] + sine * dx + cosine * dy))
+
+def _predict_marker_pixels(center_px: tuple[float, float], radius_px: float, geometry: DesignGeometry, angle_rad: float=0.0) -> dict[str, tuple[float, float]]:
+    result: dict[str, tuple[float, float]] = {}
     for side, (gx, gy) in geometry.marker_centers.items():
-        result[side] = (float(center_px[0] + (gx - geometry.center[0]) * scale), float(center_px[1] - (gy - geometry.center[1]) * scale))
+        result[side] = _project_gds_point_to_pixels((gx, gy), center_px, radius_px, geometry, angle_rad)
     return result
 
 def _make_marker_tester(original_tester_class: type, geometry: DesignGeometry, runtime_state: dict[str, Any]):
@@ -908,6 +1231,7 @@ def _make_marker_tester(original_tester_class: type, geometry: DesignGeometry, r
             display_height = int(kwargs.get('display_height', 800))
             debug = bool(kwargs.get('debug', False))
             self.image_path = str(image_path)
+            self.wafer_id = str(runtime_state.get('wafer_id') or Path(self.image_path).name or 'Unknown wafer')
             self.target_height = display_height
             self.debug = debug
             self.im = _ArrayReviewImage(ds_canvas)
@@ -981,7 +1305,7 @@ def _make_marker_tester(original_tester_class: type, geometry: DesignGeometry, r
             y0, y1 = (min(ys) - padding, max(ys) + padding)
             return [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
 
-        def _gds_template_global(self, center_review: tuple[float, float], radius_review: float, factor: float) -> dict[str, dict[str, Any]]:
+        def _gds_template_global(self, center_review: tuple[float, float], radius_review: float, factor: float, angle_rad: float=0.0) -> dict[str, dict[str, Any]]:
             """Project the exact GDS square polygons into review coordinates."""
             scale = float(radius_review) / max(float(geometry.radius), 1e-09)
             result: dict[str, dict[str, Any]] = {}
@@ -1004,8 +1328,7 @@ def _make_marker_tester(original_tester_class: type, geometry: DesignGeometry, r
                 for index, polygon in enumerate(square_polygons):
                     global_corners: list[tuple[float, float]] = []
                     for gx, gy in polygon:
-                        rx = center_review[0] + (float(gx) - geometry.center[0]) * scale
-                        ry = center_review[1] - (float(gy) - geometry.center[1]) * scale
+                        rx, ry = _project_gds_point_to_pixels((gx, gy), center_review, radius_review, geometry, angle_rad)
                         global_corners.append((rx * factor, ry * factor))
                     key = (index // 3, index % 3)
                     boxes[key] = global_corners
@@ -1248,10 +1571,10 @@ def _make_marker_tester(original_tester_class: type, geometry: DesignGeometry, r
             self._review_reduce_factor = float(factor)
             self._review_wafer_center_global = (float(center[0] * factor), float(center[1] * factor))
             self._review_wafer_radius_global = float(radius * factor)
-            predicted = _predict_marker_pixels(center, radius, geometry)
+            predicted = _predict_marker_pixels(center, radius, geometry, angle_rad=float(runtime_state.get('wafer_flat_angle_rad', 0.0) or 0.0))
             selected = dict(predicted)
             source = 'GDS/metrology predictions'
-            templates = self._gds_template_global(center, radius, factor)
+            templates = self._gds_template_global(center, radius, factor, angle_rad=float(runtime_state.get('wafer_flat_angle_rad', 0.0) or 0.0))
             raw_error: str | None = None
             tile_folder = runtime_state.get('tile_folder')
             ds_canvas = runtime_state.get('ds_canvas')
@@ -1261,6 +1584,7 @@ def _make_marker_tester(original_tester_class: type, geometry: DesignGeometry, r
             if tile_folder is not None and isinstance(ds_canvas, np.ndarray) and ds_canvas.size and (center_ds is not None) and (radius_ds is not None):
                 try:
                     raw_details = _run_raw_tile_lattice_detector(tile_folder, ds_canvas, (float(center_ds[0]), float(center_ds[1])), float(radius_ds), geometry, ds_factor, runtime_state.get('stitch_config_run', {}))
+                    raw_details = _refine_raw_details_with_production_snap(ds_canvas, raw_details)
                     if set(raw_details) == {'left', 'right'}:
                         selected = {side: (float(raw_details[side]['anchor'][0]) / factor, float(raw_details[side]['anchor'][1]) / factor) for side in ('left', 'right')}
                         templates = {side: raw_details[side]['template'] for side in ('left', 'right')}
@@ -1268,10 +1592,14 @@ def _make_marker_tester(original_tester_class: type, geometry: DesignGeometry, r
                         source = 'original-resolution raw-tile lattice detections with exact production mapping'
                         for side in ('left', 'right'):
                             diagnostics = raw_details[side]['diagnostics']
-                            print(f"[Future Raw-Tile Align v19] {side}: mode={diagnostics.get('optical_mode', 'unknown')}, fit={diagnostics.get('fit_mode', 'unknown')}, {diagnostics['match_count']}/12 squares, pitch={diagnostics['pitch_ds_px']:.3f} ds px, error={diagnostics['mean_error_ds_px']:.3f} ds px, canvas_shift=(+0.000,+0.000) px")
+                            error = diagnostics.get('mean_error_ds_px')
+                            quality = f"error={float(error):.3f} ds px" if error is not None else f"correlation={float(diagnostics.get('template_correlation', 0.0)):.3f}"
+                            refinement = diagnostics.get('production_snap_refinement', {}) or {}
+                            snap_quality = f", production_snap={float(refinement.get('score', 0.0)):.3f}, improvement={float(refinement.get('improvement', 0.0)):+.3f}, applied={bool(refinement.get('applied', False))}"
+                            print(f"[Future Raw-Tile Align v23] {side}: mode={diagnostics.get('optical_mode', 'unknown')}, fit={diagnostics.get('fit_mode', 'unknown')}, {diagnostics['match_count']}/12 squares, pitch={diagnostics['pitch_ds_px']:.3f} ds px, {quality}{snap_quality}, canvas_shift=(+0.000,+0.000) px")
                 except Exception as exc:
                     raw_error = str(exc)
-                    print(f'[Future Raw-Tile Align v19] FAILED: {raw_error}')
+                    print(f'[Future Raw-Tile Align v23] FAILED: {raw_error}')
             if source == 'GDS/metrology predictions':
                 try:
                     normalized, normalized_to_review = _normalized_wafer_view(review_bgr, center, radius, geometry.design_bbox)
@@ -1679,57 +2007,37 @@ def _resolve_marker_pair(tester: Any, markers: dict[str, list[dict[str, Any]]], 
     source_radius = float(radius_ds)
     coordinate_frame = 'production downscaled stitch'
     base_scale = float(gds_R) / max(source_radius, 1e-09)
-    physical = {'left': ((float(left[0]) - source_center_x) * base_scale + float(gds_xc), (source_center_y - float(left[1])) * base_scale + float(gds_yc)), 'right': ((float(right[0]) - source_center_x) * base_scale + float(gds_xc), (source_center_y - float(right[1])) * base_scale + float(gds_yc))}
-    angle, tx, ty, scale = _similarity_from_two_points(physical, geometry.marker_centers)
+    physical = {'left': ((float(left[0]) - source_center_x) * base_scale, (source_center_y - float(left[1])) * base_scale), 'right': ((float(right[0]) - source_center_x) * base_scale, (source_center_y - float(right[1])) * base_scale)}
+    nominal_centered = {side: (float(point[0]) - float(gds_xc), float(point[1]) - float(gds_yc)) for side, point in geometry.marker_centers.items()}
+    angle, tx, ty, scale = _similarity_from_two_points(physical, nominal_centered)
     fit_mode = 'two fitted-lattice marker centers'
     fit_rms_um: float | None = None
-    manual_similarity_flags = getattr(tester, '_manual_similarity_edited', {}) or {}
-    edited_sides = [side for side in ('left', 'right') if bool(manual_similarity_flags.get(side, False))]
-    if edited_sides:
-        try:
-            source_rows: list[np.ndarray] = []
-            target_rows: list[np.ndarray] = []
-            center_repeat = 6
-            for side in ('left', 'right'):
-                source_rows.append(np.repeat(np.asarray([physical[side]], dtype=np.float64), center_repeat, axis=0))
-                target_rows.append(np.repeat(np.asarray([geometry.marker_centers[side]], dtype=np.float64), center_repeat, axis=0))
-            for side in edited_sides:
-                square_dict = getattr(tester, f'{side}_squares_global', {}) or {}
-                square_pixels = [(float(point[0]), float(point[1])) for point in square_dict.values()]
-                if len(square_pixels) != 12:
-                    raise ValueError(f'{side} review contains {len(square_pixels)} square centers')
-                square_physical = np.asarray([((px - source_center_x) * base_scale + float(gds_xc), (source_center_y - py) * base_scale + float(gds_yc)) for px, py in square_pixels], dtype=np.float64)
-                source_rows.append(_ordered_grid_centers(square_physical))
-                target_rows.append(_nominal_marker_square_centers(geometry, side))
-            source_array = np.vstack(source_rows)
-            target_array = np.vstack(target_rows)
-            angle, tx, ty, scale, fit_rms_um = _fit_similarity_multipoint(source_array, target_array)
-            fit_mode = f"manual direct-template similarity fit (centers + {', '.join(edited_sides)} square grid)"
-        except Exception as fit_exc:
-            print(f'[{out_stem} Auto-Align] Manual square-grid fit unavailable; using marker centers ({fit_exc}).')
-            fit_mode = 'two fitted-lattice marker centers; manual-grid fallback'
-    else:
-        try:
-            source_points: list[np.ndarray] = []
-            target_points: list[np.ndarray] = []
-            cosine = math.cos(angle)
-            sine = math.sin(angle)
-            rotation = np.asarray([[cosine, -sine], [sine, cosine]], dtype=np.float64)
-            for side in ('left', 'right'):
-                square_dict = getattr(tester, f'{side}_squares_global', {}) or {}
-                square_pixels = [(float(point[0]), float(point[1])) for point in square_dict.values()]
-                if len(square_pixels) != 12:
-                    raise ValueError(f'{side} review contains {len(square_pixels)} square centers')
-                square_physical = np.asarray([((px - source_center_x) * base_scale + float(gds_xc), (source_center_y - py) * base_scale + float(gds_yc)) for px, py in square_pixels], dtype=np.float64)
-                source_points.append(_ordered_grid_centers(square_physical))
-                target_points.append(_nominal_marker_square_centers(geometry, side))
-            source_array = np.vstack(source_points)
-            target_array = np.vstack(target_points)
-            fitted = (scale * (rotation @ source_array.T)).T + np.asarray([tx, ty])
-            fit_rms_um = float(np.sqrt(np.mean(np.sum((fitted - target_array) ** 2, axis=1))))
-            fit_mode += '; 24-square validation only'
-        except Exception as fit_exc:
-            print(f'[{out_stem} Auto-Align] Square-grid validation unavailable: {fit_exc}')
+    # The two reviewed marker centers define the global wafer similarity exactly.
+    # Per-side square edits and snaps refine those centers locally; allowing the
+    # 24 square corners to re-solve the global transform can compromise the two
+    # authoritative centers and make the following alignment UI show a different
+    # registration.  Keep the grids as a diagnostic validation only.
+    try:
+        source_points: list[np.ndarray] = []
+        target_points: list[np.ndarray] = []
+        cosine = math.cos(angle)
+        sine = math.sin(angle)
+        rotation = np.asarray([[cosine, -sine], [sine, cosine]], dtype=np.float64)
+        for side in ('left', 'right'):
+            square_dict = getattr(tester, f'{side}_squares_global', {}) or {}
+            square_pixels = [(float(point[0]), float(point[1])) for point in square_dict.values()]
+            if len(square_pixels) != 12:
+                raise ValueError(f'{side} review contains {len(square_pixels)} square centers')
+            square_physical = np.asarray([((px - source_center_x) * base_scale, (source_center_y - py) * base_scale) for px, py in square_pixels], dtype=np.float64)
+            source_points.append(_ordered_grid_centers(square_physical))
+            target_points.append(_nominal_marker_square_centers(geometry, side) - np.asarray([gds_xc, gds_yc], dtype=np.float64))
+        source_array = np.vstack(source_points)
+        target_array = np.vstack(target_points)
+        fitted = (scale * (rotation @ source_array.T)).T + np.asarray([tx, ty])
+        fit_rms_um = float(np.sqrt(np.mean(np.sum((fitted - target_array) ** 2, axis=1))))
+        fit_mode += '; 24-square validation only'
+    except Exception as fit_exc:
+        print(f'[{out_stem} Auto-Align] Square-grid validation unavailable: {fit_exc}')
     left_mode = 'manual' if getattr(tester, 'left_was_manual', False) else 'automatic'
     right_mode = 'manual' if getattr(tester, 'right_was_manual', False) else 'automatic'
     debug_dir = Path('alignment_debug')

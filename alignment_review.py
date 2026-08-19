@@ -6,7 +6,7 @@ import time
 from typing import Any, Iterable
 import cv2
 import numpy as np
-UPGRADE_VERSION = 'alignment-marker-review-v2-switchable-nudge-svd-snap-2026-08-10'
+UPGRADE_VERSION = 'alignment-marker-review-v5-production-score-auto-refine-2026-08-19'
 
 def _real_box_items(boxes: dict[Any, Any]) -> list[tuple[Any, list[tuple[float, float]]]]:
     result: list[tuple[Any, list[tuple[float, float]]]] = []
@@ -233,7 +233,8 @@ def _refine_snap_with_vertices(image_bgr: np.ndarray, items: list[tuple[Any, lis
 def find_local_template_snap(image_bgr: np.ndarray, boxes: dict[Any, Any], squares: dict[Any, Any], marker: tuple[float, float], *, angle_candidates: Iterable[float] | None=None, scale_candidates: Iterable[float] | None=None) -> dict[str, Any]:
     """Fit a GDS-derived square template to nearby optical edges and vertices.
 
-    The coarse pass searches a wider nearby area than v1. A second pass refines
+    The coarse pass searches several lattice pitches so that a tempting partial
+    row/column match cannot hide a stronger full-marker match. A second pass refines
     the best angle/scale neighborhood, then a bounded SVD/Procrustes solve uses
     nearby optical corners to improve the rotation and scale when the vertices
     support it.
@@ -246,7 +247,11 @@ def find_local_template_snap(image_bgr: np.ndarray, boxes: dict[Any, Any], squar
     if len(center_points) < 4:
         center_points = [(float(np.mean([p[0] for p in corners])), float(np.mean([p[1] for p in corners]))) for _key, corners in items]
     pitch = max(8.0, _nearest_neighbor_pitch(center_points))
-    search_radius = int(np.clip(round(0.9 * pitch), 32, 640))
+    # A manual absolute click can easily land one to three repeated-square pitches
+    # from the actual marker.  The old 0.9-pitch window made the incorrect nearby
+    # partial lattice the only candidate.  Keep this bounded, but include the whole
+    # ambiguity range observed on the LOR left markers.
+    search_radius = int(np.clip(round(4.25 * pitch), 72, 720))
     supplied_angles = angle_candidates is not None
     supplied_scales = scale_candidates is not None
     if angle_candidates is None:
@@ -410,6 +415,11 @@ def build_staged_marker_reviewer(base_class) -> None:
             self._snap_button_bounds: dict[str, tuple[int, int, int, int]] = {}
             self._snap_status = {'left': 'Available after absolute placement', 'right': 'Available after absolute placement'}
             self._snap_busy = False
+            self._wafer_badge_hovered = False
+            self._wafer_badge_text = 'hover for name'
+            badge_text_size = cv2.getTextSize(self._wafer_badge_text, cv2.FONT_HERSHEY_SIMPLEX, 0.29, 1)[0]
+            badge_x1, badge_y1 = (14, 23)
+            self._wafer_badge_bounds = (badge_x1, badge_y1, badge_x1 + badge_text_size[0] + 12, badge_y1 + badge_text_size[1] + 12)
             self._alignment_marker_upgrade_ready = True
             self._layout_upgrade_buttons()
             self.redraw_gui()
@@ -608,7 +618,10 @@ def build_staged_marker_reviewer(base_class) -> None:
                 points = [point for _key, corners in items for point in corners]
                 centers = [point for key, point in squares.items() if key != ('area', 0)]
                 pitch = max(8.0, _nearest_neighbor_pitch(centers))
-                margin = int(np.clip(round(2.7 * pitch), 110, 1400))
+                # The snapper searches 4.25 pitches.  Retain a little more than that
+                # around the complete template so the high-score pose is not clipped
+                # by this outer UI crop before the snapper can evaluate it.
+                margin = int(np.clip(round(5.0 * pitch), 180, 1600))
                 x0 = max(0, int(math.floor(min([p[0] for p in points] + [marker[0]]) - margin)))
                 y0 = max(0, int(math.floor(min([p[1] for p in points] + [marker[1]]) - margin)))
                 x1 = min(self.orig_w, int(math.ceil(max([p[0] for p in points] + [marker[0]]) + margin)))
@@ -712,16 +725,25 @@ def build_staged_marker_reviewer(base_class) -> None:
                 self.canvas = np.zeros((self.canvas_h, self.canvas_w, 3), dtype=np.uint8)
             self.canvas[:] = 0
             cv2.rectangle(self.canvas, (0, 0), (self.canvas_w, self.top_bar_h), self.status_bg_color, -1)
+            badge_x1, badge_y1, badge_x2, badge_y2 = self._wafer_badge_bounds
+            badge_fill = (38, 73, 67) if self._wafer_badge_hovered else (28, 58, 53)
+            badge_border = (118, 218, 186) if self._wafer_badge_hovered else (74, 157, 137)
+            cv2.rectangle(self.canvas, (badge_x1, badge_y1), (badge_x2, badge_y2), badge_fill, -1)
+            cv2.rectangle(self.canvas, (badge_x1, badge_y1), (badge_x2, badge_y2), badge_border, 1)
+            badge_text_size = cv2.getTextSize(self._wafer_badge_text, cv2.FONT_HERSHEY_SIMPLEX, 0.29, 1)[0]
+            badge_text_y = badge_y1 + (badge_y2 - badge_y1 + badge_text_size[1]) // 2
+            cv2.putText(self.canvas, self._wafer_badge_text, (badge_x1 + 6, badge_text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.29, (205, 234, 224), 1, cv2.LINE_AA)
             title = str(self.status_text).replace('\n', ' ')
             if len(title) > 112:
                 title = title[:109] + '...'
             title_w = cv2.getTextSize(title, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)[0][0]
-            cv2.putText(self.canvas, title, (max(8, (self.canvas_w - title_w) // 2), 27), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (235, 255, 235), 1, cv2.LINE_AA)
+            status_left = badge_x2 + 18
+            cv2.putText(self.canvas, title, (max(status_left, status_left + (self.canvas_w - status_left - title_w) // 2), 27), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (235, 255, 235), 1, cv2.LINE_AA)
             instruction = self._stage_instruction()
             if len(instruction) > 118:
                 instruction = instruction[:115] + '...'
             inst_w = cv2.getTextSize(instruction, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)[0][0]
-            cv2.putText(self.canvas, instruction, (max(8, (self.canvas_w - inst_w) // 2), 54), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(self.canvas, instruction, (max(status_left, status_left + (self.canvas_w - status_left - inst_w) // 2), 54), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 255), 1, cv2.LINE_AA)
             self.canvas[self.top_bar_h:self.top_bar_h + self.target_height, 0:self.display_width] = self.preview_color.copy()
             self._draw_side_on_main('left')
             self._draw_side_on_main('right')
@@ -740,6 +762,16 @@ def build_staged_marker_reviewer(base_class) -> None:
             for key in ('manual', 'left', 'right', 'done', 'reset', 'accept'):
                 self._draw_bottom_button(key)
             cv2.putText(self.canvas, 'Keys: M manual | L/R select | D done toggle | arrows 1 px | Shift+arrows 10 px | P reset | Enter/A accept | Q/Esc exit', (14, self.canvas_h - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (150, 150, 150), 1, cv2.LINE_AA)
+            if self._wafer_badge_hovered:
+                wafer_name = str(getattr(self, 'wafer_id', '') or 'Unknown wafer')
+                tooltip = f'Current wafer:  {wafer_name}'
+                tooltip_w = cv2.getTextSize(tooltip, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)[0][0]
+                tx1, ty1 = (badge_x1, self.top_bar_h + 8)
+                tx2, ty2 = (min(self.canvas_w - 12, tx1 + tooltip_w + 28), ty1 + 38)
+                cv2.rectangle(self.canvas, (tx1 + 3, ty1 + 4), (tx2 + 3, ty2 + 4), (10, 10, 12), -1)
+                cv2.rectangle(self.canvas, (tx1, ty1), (tx2, ty2), (31, 37, 39), -1)
+                cv2.rectangle(self.canvas, (tx1, ty1), (tx2, ty2), (104, 215, 180), 1)
+                cv2.putText(self.canvas, tooltip, (tx1 + 14, ty1 + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (232, 247, 242), 1, cv2.LINE_AA)
             cv2.imshow('Large Wafer Tester', self.canvas)
 
         def handle_click(self, event, x, y, flags, param) -> None:
@@ -781,6 +813,10 @@ def build_staged_marker_reviewer(base_class) -> None:
                     self._main_drag_side = active
                 return
             if event == cv2.EVENT_MOUSEMOVE:
+                hovered = _inside(self._wafer_badge_bounds, x, y)
+                if hovered != self._wafer_badge_hovered:
+                    self._wafer_badge_hovered = hovered
+                    self.redraw_gui()
                 if self._panel_drag_side is not None and flags & cv2.EVENT_FLAG_LBUTTON:
                     self._continue_panel_drag(x, y)
                     return

@@ -51,44 +51,67 @@ class ManualAlignApp:
 
         style = ttk.Style()
         style.theme_use("clam")
+        self.root.configure(bg="#111715")
+
+        # Keep the established layout, but give its controls a calmer visual
+        # hierarchy and consistent surface, text, and interaction colors.
+        surface = "#202724"
+        text = "#F1F5F3"
+        muted = "#A8B5AF"
+        accent = "#18A66A"
+        style.configure("TFrame", background=surface)
+        style.configure("Surface.TFrame", background=surface)
+        style.configure("TLabel", background=surface, foreground=text, font=("Segoe UI", 9))
+        style.configure("Section.TLabel", background=surface, foreground=text, font=("Segoe UI Semibold", 10))
+        style.configure("PanelTitle.TLabel", background=surface, foreground="#64D99F", font=("Segoe UI Semibold", 11))
+        style.configure("MarkerTitle.TLabel", background=surface, foreground=muted, font=("Segoe UI Semibold", 9))
+        style.configure("Status.TLabel", background=surface, foreground="#B7C8C0", font=("Segoe UI Semibold", 9))
+        style.configure("TEntry", fieldbackground="#111715", foreground="#F4F7F5", insertcolor="#F4F7F5", bordercolor="#4A5B54", lightcolor="#4A5B54", darkcolor="#4A5B54", padding=4)
+        style.map("TEntry", bordercolor=[("focus", accent)], lightcolor=[("focus", accent)], darkcolor=[("focus", accent)])
+        style.configure("TButton", background="#303A36", foreground="#E8EEEB", bordercolor="#4A5A53", lightcolor="#4A5A53", darkcolor="#4A5A53", font=("Segoe UI", 9), padding=(6, 3))
+        style.map("TButton", background=[("pressed", "#1F2B26"), ("active", "#3B4943")], foreground=[("disabled", "#718079"), ("!disabled", "#F1F5F3")], bordercolor=[("focus", accent), ("active", "#698078")])
+        style.configure("Confirm.TButton", background=accent, foreground="#071A12", bordercolor="#37C983", lightcolor="#37C983", darkcolor="#0B7548", font=("Segoe UI Semibold", 10), padding=(8, 7))
+        style.map("Confirm.TButton", background=[("pressed", "#118653"), ("active", "#28BD7A")], foreground=[("disabled", "#52685E"), ("!disabled", "#071A12")])
 
         # Dedicated logo header: it consumes its own row and never overlays the wafer.
-        header = tk.Frame(self.root, height=44, bg="#FFFFFF")
+        header = tk.Frame(self.root, height=44, bg="#075B38", highlightthickness=0)
         header.grid(row=0, column=0, columnspan=3, sticky="ew")
         header.grid_propagate(False)
         try:
             from pathlib import Path as _Path
             logo_path = _Path(__file__).resolve().parent / "assets" / "h2pLogo.png"
             logo_image = Image.open(logo_path).convert("RGBA")
-            logo_image.thumbnail((76, 36), Image.Resampling.LANCZOS)
+            logo_image.thumbnail((70, 32), Image.Resampling.LANCZOS)
             self._h2p_alignment_logo = ImageTk.PhotoImage(logo_image, master=self.root)
-            tk.Label(header, image=self._h2p_alignment_logo, bg="#FFFFFF", bd=0).pack(pady=(3, 0))
+            logo_card = tk.Frame(header, bg="#F7F8F7", highlightthickness=1, highlightbackground="#D5DDD9")
+            logo_card.pack(pady=3)
+            tk.Label(logo_card, image=self._h2p_alignment_logo, bg="#F7F8F7", bd=0).pack(padx=10, pady=1)
         except Exception:
             pass
 
-        self.sidebar = ttk.Frame(self.root, padding=15, width=340)
+        self.sidebar = ttk.Frame(self.root, padding=15, width=340, style="Surface.TFrame")
         self.sidebar.grid(row=1, column=0, sticky="ns", padx=5, pady=5)
         self.sidebar.grid_propagate(False)
 
-        self.canvas = tk.Canvas(self.root, width=self.V_w, height=self.V_h, bg="#1e1e1e", highlightthickness=0)
+        self.canvas = tk.Canvas(self.root, width=self.V_w, height=self.V_h, bg="#0D1210", highlightthickness=1, highlightbackground="#34413C")
         self.canvas.grid(row=1, column=1, padx=5, pady=10)
 
-        self.marker_panel = ttk.Frame(self.root, padding=10, width=250)
+        self.marker_panel = ttk.Frame(self.root, padding=10, width=250, style="Surface.TFrame")
         self.marker_panel.grid(row=1, column=2, sticky="ns", padx=5, pady=5)
         self.marker_panel.grid_propagate(False)
 
-        ttk.Label(self.marker_panel, text="Marker Alignment Assistant", font=("Helvetica", 11, "bold")).pack(anchor="n", pady=(0, 10))
+        ttk.Label(self.marker_panel, text="Marker Alignment Assistant", style="PanelTitle.TLabel").pack(anchor="n", pady=(0, 10))
 
-        ttk.Label(self.marker_panel, text="Left Marker (GDS Layer 4)", font=("Helvetica", 9, "bold")).pack(anchor="w", pady=(5, 2))
-        self.left_zoom_canvas = tk.Canvas(self.marker_panel, width=220, height=220, bg="#151515", highlightthickness=1, highlightbackground="#444")
+        ttk.Label(self.marker_panel, text="Left Marker (GDS Layer 4)", style="MarkerTitle.TLabel").pack(anchor="w", pady=(5, 2))
+        self.left_zoom_canvas = tk.Canvas(self.marker_panel, width=220, height=220, bg="#0D1210", highlightthickness=1, highlightbackground="#45665A")
         self.left_zoom_canvas.pack(anchor="w", pady=(0, 15))
 
-        ttk.Label(self.marker_panel, text="Right Marker (GDS Layer 4)", font=("Helvetica", 9, "bold")).pack(anchor="w", pady=(5, 2))
-        self.right_zoom_canvas = tk.Canvas(self.marker_panel, width=220, height=220, bg="#151515", highlightthickness=1, highlightbackground="#444")
+        ttk.Label(self.marker_panel, text="Right Marker (GDS Layer 4)", style="MarkerTitle.TLabel").pack(anchor="w", pady=(5, 2))
+        self.right_zoom_canvas = tk.Canvas(self.marker_panel, width=220, height=220, bg="#0D1210", highlightthickness=1, highlightbackground="#45665A")
         self.right_zoom_canvas.pack(anchor="w", pady=(0, 15))
 
         # GUI controls setup
-        ttk.Label(self.sidebar, text="1. Rotation (Degrees)", font=("Helvetica", 10, "bold")).pack(anchor="w", pady=(0, 2))
+        ttk.Label(self.sidebar, text="1. Rotation (Degrees)", style="Section.TLabel").pack(anchor="w", pady=(0, 2))
         rot_frame = ttk.Frame(self.sidebar)
         rot_frame.pack(fill="x", pady=(0, 10))
         self.rot_var = tk.StringVar(value=f"{self.current_angle_deg:.3f}")
@@ -101,7 +124,7 @@ class ManualAlignApp:
         for idx, (txt, val) in enumerate([("-0.10°", -0.1), ("-0.01°", -0.01), ("+0.01°", 0.01), ("+0.10°", 0.1)]):
             ttk.Button(rot_btn_frame, text=txt, width=7, command=lambda v=val: self.adjust_angle(v)).grid(row=0, column=idx, padx=2)
 
-        ttk.Label(self.sidebar, text="2. Translation X (microns)", font=("Helvetica", 10, "bold")).pack(anchor="w", pady=(0, 2))
+        ttk.Label(self.sidebar, text="2. Translation X (microns)", style="Section.TLabel").pack(anchor="w", pady=(0, 2))
         tx_frame = ttk.Frame(self.sidebar)
         tx_frame.pack(fill="x", pady=(0, 10))
         self.tx_var = tk.StringVar(value=f"{self.offset_x:.1f}")
@@ -114,7 +137,7 @@ class ManualAlignApp:
         for idx, (txt, val) in enumerate([("-50µm", -50.0), ("-5µm", -5.0), ("+5µm", 5.0), ("+50µm", 50.0)]):
             ttk.Button(tx_btn_frame, text=txt, width=7, command=lambda v=val: self.adjust_tx(v)).grid(row=0, column=idx, padx=2)
 
-        ttk.Label(self.sidebar, text="3. Translation Y (microns)", font=("Helvetica", 10, "bold")).pack(anchor="w", pady=(0, 2))
+        ttk.Label(self.sidebar, text="3. Translation Y (microns)", style="Section.TLabel").pack(anchor="w", pady=(0, 2))
         ty_frame = ttk.Frame(self.sidebar)
         ty_frame.pack(fill="x", pady=(0, 10))
         self.ty_var = tk.StringVar(value=f"{self.offset_y:.1f}")
@@ -127,7 +150,7 @@ class ManualAlignApp:
         for idx, (txt, val) in enumerate([("-50µm", -50.0), ("-5µm", -5.0), ("+5µm", 5.0), ("+50µm", 50.0)]):
             ttk.Button(ty_btn_frame, text=txt, width=7, command=lambda v=val: self.adjust_ty(v)).grid(row=0, column=idx, padx=2)
 
-        ttk.Label(self.sidebar, text="4. Scale Factor Multiplier", font=("Helvetica", 10, "bold")).pack(anchor="w", pady=(0, 2))
+        ttk.Label(self.sidebar, text="4. Scale Factor Multiplier", style="Section.TLabel").pack(anchor="w", pady=(0, 2))
         sc_frame = ttk.Frame(self.sidebar)
         sc_frame.pack(fill="x", pady=(0, 10))
         self.scale_var = tk.StringVar(value=f"{self.scale_mult:.5f}")
@@ -140,11 +163,10 @@ class ManualAlignApp:
         for idx, (txt, val) in enumerate([("-0.50%", -0.005), ("-0.05%", -0.0005), ("+0.05%", 0.0005), ("+0.50%", 0.005)]):
             ttk.Button(sc_btn_frame, text=txt, width=7, command=lambda v=val: self.adjust_scale(v)).grid(row=0, column=idx, padx=2)
 
-        self.status_label = ttk.Label(self.sidebar, text="", font=("Helvetica", 9, "bold"), justify="left")
+        self.status_label = ttk.Label(self.sidebar, text="", style="Status.TLabel", justify="left")
         self.status_label.pack(anchor="w", pady=(0, 25))
 
-        ttk.Button(self.sidebar, text="✔ Confirm Settings", command=self.confirm).pack(fill="x", pady=4)
-        ttk.Button(self.sidebar, text="✖ Cancel (No Calibration)", command=self.cancel).pack(fill="x", pady=4)
+        ttk.Button(self.sidebar, text="Confirm Settings", command=self.confirm, style="Confirm.TButton").pack(fill="x", pady=4)
 
     def setup_bindings(self):
         self.canvas.bind("<ButtonPress-1>", self.on_drag_start)
